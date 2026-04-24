@@ -34,7 +34,7 @@ The included examples are:
 
 - [demo-real.bwo](examples/demo-real.bwo)
 - [demo-protected.bwo](examples/demo-protected.bwo)
-- [demo-assets.bwo](demo-assets.bwo)
+- [demo-assets.bwo](examples/demo-assets.bwo)
 - [demo-timer.bwo](examples/demo-timer.bwo)
 
 ## DSL Features
