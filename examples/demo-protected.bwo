@@ -1,0 +1,93 @@
+(defos *protected-mode-demo* (:target (:x86-bios :kernel-segment #x1000))
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading protected-mode demo
+")
+      (bios-print "Bootwright stage 1: loading protected-mode kernel...")
+      (load-section kernel32 :on-error disk-error)
+      (bios-print "Stage 1 complete. Jumping to kernel...")
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string enter-pmode-banner "Kernel loaded. Entering protected mode...")
+    (string debug-pmode-ready "kernel: protected mode + paging active
+")
+    (string debug-boot-mismatch "kernel: boot info handoff mismatch
+")
+    (string debug-int-serviced "kernel: int 0x30 serviced
+")
+    (string debug-int-returned "kernel: returned from int 0x30
+")
+    (string debug-unexpected-int "kernel: unexpected interrupt
+")
+    (string screen-ready "GDT, IDT, PIC and paging loaded.")
+    (string screen-handoff "Boot info handoff verified.")
+    (string screen-interrupt "Invoking software interrupt 0x30...")
+    (string screen-returned "INT 0x30 returned successfully.")
+    (string screen-parked "Kernel is now parked in a safe loop.")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print enter-pmode-banner)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :boot-info boot-info
+                            :entry protected-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine protected-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (pic-remap :master-mask #xFF :slave-mask #xFF)
+      (load-idt idt-descriptor)
+      (enable-paging :page-directory page-directory :cr4-mask #x10)
+      (cmp esi boot-info)
+      (jz boot-info-ok)
+      (debug-print debug-boot-mismatch)
+      (hang)
+      (label boot-info-ok)
+      (clear-vga :attribute #x17)
+      (vga-box :row 0 :column 0 :width 42 :height 8
+               :attribute #x1E
+               :title "Bootwright protected demo")
+      (debug-print debug-pmode-ready)
+      (vga-print-at screen-ready :row 2 :column 2 :attribute #x1A)
+      (vga-print-at screen-handoff :row 3 :column 2 :attribute #x1A)
+      (vga-print-at screen-interrupt :row 4 :column 2 :attribute #x1F)
+      (int #x30)
+      (debug-print debug-int-returned)
+      (vga-print-at screen-returned :row 5 :column 2 :attribute #x2F)
+      (vga-print-at screen-parked :row 6 :column 2 :attribute #x2E)
+      (hang))
+    (routine default-interrupt
+      (push eax)
+      (push esi)
+      (debug-print debug-unexpected-int)
+      (pop esi)
+      (pop eax)
+      (hang))
+    (routine test-interrupt
+      (push eax)
+      (push esi)
+      (debug-print debug-int-serviced)
+      (pop esi)
+      (pop eax)
+      (iret))
+    (idt idt (:pointer idt-descriptor :selector #x08 :default default-interrupt)
+      (:entry #x30 test-interrupt))
+    (boot-info boot-info (:gdt gdt
+                          :idt idt
+                          :page-directory page-directory
+                          :entry protected-main))
+    (align 4096)
+    (page-directory page-directory (:count 1024)
+      (:page4mib 0 0 :flags #x003))))
