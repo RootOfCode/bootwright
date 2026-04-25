@@ -120,6 +120,39 @@
       (segment-register-p operand)
       (control-register-p operand)))
 
+(defun operand-width (operand)
+  (cond ((byte-register-p operand) 8)
+        ((word-register-p operand) 16)
+        ((dword-register-p operand) 32)
+        (t nil)))
+
+(defun memory-width-designator-p (operand)
+  (and (typep operand '(or symbol string))
+       (case (token-keyword operand)
+         (:byte 8)
+         (:word 16)
+         (:dword 32)
+         (t nil))))
+
+(defun memory-operand-p (operand)
+  (and (consp operand)
+       (eq (token-keyword (first operand)) :MEM)))
+
+(defun memory-operand-width (operand)
+  (when (memory-operand-p operand)
+    (memory-width-designator-p (second operand))))
+
+(defun parse-memory-operand (operand)
+  (unless (memory-operand-p operand)
+    (error "Expected a memory operand, got ~S." operand))
+  (let* ((parts (rest operand))
+         (width (memory-width-designator-p (first parts))))
+    (when width
+      (setf parts (rest parts)))
+    (unless parts
+      (error "Memory operand ~S is missing an address." operand))
+    (values width parts)))
+
 (defun label-reference-p (operand)
   (and (consp operand)
        (eq (first operand) :label)
@@ -162,10 +195,30 @@
         (t
          operand)))
 
+(defun emit-signed-u8 (state value)
+  (unless (typep value '(integer -128 255))
+    (error "Value ~S does not fit in an 8-bit signed/unsigned field." value))
+  (emit-u8 state (ldb (byte 8 0) value)))
+
+(defun emit-signed-u32 (state value)
+  (unless (typep value '(integer -2147483648 4294967295))
+    (error "Value ~S does not fit in a 32-bit signed/unsigned field." value))
+  (emit-u32 state (ldb (byte 32 0) value)))
+
 (defun emit-modrm (state mod reg rm)
   (emit-u8 state (logior (ash mod 6)
                          (ash reg 3)
                          rm)))
+
+(defun emit-sib (state scale index base)
+  (let ((scale-bits (ecase scale
+                      (1 0)
+                      (2 1)
+                      (4 2)
+                      (8 3))))
+    (emit-u8 state (logior (ash scale-bits 6)
+                           (ash index 3)
+                           base))))
 
 (defun add-fixup (state kind target position &optional (addend 0))
   (push (make-fixup :kind kind :position position :target target :addend addend)
@@ -319,27 +372,155 @@
     (emit-u8 state opcode)
     (emit-modrm state 3 src dst)))
 
-(defun emit-group1-immediate (state opcode-ext register operand width)
-  (let ((reg (or (dword-register-p register)
-                 (word-register-p register)
-                 (byte-register-p register))))
+(defun ensure-memory-width (operand width)
+  (let ((declared-width (memory-operand-width operand)))
+    (when (and declared-width (/= declared-width width))
+      (error "Memory operand ~S declares width ~D, but the instruction requires ~D."
+             operand declared-width width))
+    width))
+
+(defun emit-memory-reference-32 (state reg-field operand)
+  (multiple-value-bind (_ parts)
+      (parse-memory-operand operand)
+    (declare (ignore _))
+    (flet ((base-register-code (designator)
+             (or (dword-register-p designator)
+                 (error "32-bit memory addressing requires a 32-bit base register, got ~S."
+                        designator))))
+      (case (length parts)
+        (1
+         (let ((part (first parts)))
+           (if (dword-register-p part)
+               (let ((base (base-register-code part)))
+                 (cond ((= base 4)
+                        (emit-modrm state 0 reg-field 4)
+                        (emit-sib state 1 4 4))
+                       ((= base 5)
+                        (emit-modrm state 1 reg-field 5)
+                        (emit-signed-u8 state 0))
+                       (t
+                        (emit-modrm state 0 reg-field base))))
+               (progn
+                 (emit-modrm state 0 reg-field 5)
+                 (emit-imm32 state part)))))
+        ((2 4)
+         (let ((base (first parts))
+               (displacement (if (= (length parts) 2)
+                                 (second parts)
+                                 (fourth parts))))
+           (unless (integerp displacement)
+             (error "Memory displacement must be an integer, got ~S." displacement))
+           (if (= (length parts) 2)
+               (let ((base-code (base-register-code base)))
+                 (cond ((and (/= base-code 5)
+                             (typep displacement '(integer -128 127))
+                             (/= displacement 0))
+                        (if (= base-code 4)
+                            (progn
+                              (emit-modrm state 1 reg-field 4)
+                              (emit-sib state 1 4 4))
+                            (emit-modrm state 1 reg-field base-code))
+                        (emit-signed-u8 state displacement))
+                       ((and (/= base-code 5) (= displacement 0))
+                        (if (= base-code 4)
+                            (progn
+                              (emit-modrm state 0 reg-field 4)
+                              (emit-sib state 1 4 4))
+                            (emit-modrm state 0 reg-field base-code)))
+                       (t
+                        (if (= base-code 4)
+                            (progn
+                              (emit-modrm state 2 reg-field 4)
+                              (emit-sib state 1 4 4))
+                            (emit-modrm state 2 reg-field base-code))
+                        (emit-signed-u32 state displacement))))
+               (destructuring-bind (base index scale _disp) parts
+                 (declare (ignore _disp))
+                 (let ((base-code (base-register-code base))
+                       (index-code (base-register-code index)))
+                   (when (= index-code 4)
+                     (error "ESP cannot be used as a scaled index in ~S." operand))
+                   (cond ((and (/= base-code 5)
+                               (typep displacement '(integer -128 127))
+                               (/= displacement 0))
+                          (emit-modrm state 1 reg-field 4)
+                          (emit-sib state scale index-code base-code)
+                          (emit-signed-u8 state displacement))
+                         ((and (/= base-code 5) (= displacement 0))
+                          (emit-modrm state 0 reg-field 4)
+                          (emit-sib state scale index-code base-code))
+                         (t
+                          (emit-modrm state (if (typep displacement '(integer -128 127)) 1 2)
+                                      reg-field
+                                      4)
+                          (emit-sib state scale index-code base-code)
+                          (if (typep displacement '(integer -128 127))
+                              (emit-signed-u8 state displacement)
+                              (emit-signed-u32 state displacement)))))))))
+        (t
+         (error "Unsupported memory operand syntax ~S." operand))))))
+
+(defun emit-modrm-r/m (state reg-field operand)
+  (cond ((dword-register-p operand)
+         (emit-modrm state 3 reg-field (dword-register-p operand)))
+        ((word-register-p operand)
+         (emit-modrm state 3 reg-field (word-register-p operand)))
+        ((byte-register-p operand)
+         (emit-modrm state 3 reg-field (byte-register-p operand)))
+        ((memory-operand-p operand)
+         (ecase (assembly-bits state)
+           (16
+            (multiple-value-bind (_ parts)
+                (parse-memory-operand operand)
+              (declare (ignore _))
+              (unless (= (length parts) 1)
+                (error "16-bit memory operands currently support direct addresses only, got ~S."
+                       operand))
+              (emit-modrm state 0 reg-field 6)
+              (emit-imm16 state (first parts))))
+           (32
+            (emit-memory-reference-32 state reg-field operand))))
+        (t
+         (error "Unsupported r/m operand ~S." operand))))
+
+(defun emit-r/m-register (state opcode r/m-operand register width register-class)
+  (let ((reg (register-code register register-class)))
     (unless reg
-      (error "Unsupported operand ~S for grouped arithmetic." register))
-    (ecase width
-      (8
-       (emit-u8 state #x80)
-       (emit-modrm state 3 opcode-ext reg)
-       (emit-imm8 state operand))
-      (16
-       (emit-operand-size-prefix state 16)
-       (emit-u8 state #x81)
-       (emit-modrm state 3 opcode-ext reg)
-       (emit-imm16 state operand))
-      (32
-       (emit-operand-size-prefix state 32)
-       (emit-u8 state #x81)
-       (emit-modrm state 3 opcode-ext reg)
-       (emit-imm32 state operand)))))
+      (error "Unsupported register operand ~S." register))
+    (when (memory-operand-p r/m-operand)
+      (ensure-memory-width r/m-operand width))
+    (emit-operand-size-prefix state width)
+    (emit-u8 state opcode)
+    (emit-modrm-r/m state reg r/m-operand)))
+
+(defun emit-register-r/m (state opcode register r/m-operand width register-class)
+  (let ((reg (register-code register register-class)))
+    (unless reg
+      (error "Unsupported register operand ~S." register))
+    (when (memory-operand-p r/m-operand)
+      (ensure-memory-width r/m-operand width))
+    (emit-operand-size-prefix state width)
+    (emit-u8 state opcode)
+    (emit-modrm-r/m state reg r/m-operand)))
+
+(defun emit-group1-immediate (state opcode-ext operand immediate width)
+  (when (memory-operand-p operand)
+    (ensure-memory-width operand width))
+  (ecase width
+    (8
+     (emit-u8 state #x80)
+     (emit-modrm-r/m state opcode-ext operand)
+     (emit-imm8 state immediate))
+    (16
+     (emit-operand-size-prefix state 16)
+     (emit-u8 state #x81)
+     (emit-modrm-r/m state opcode-ext operand)
+     (emit-imm16 state immediate))
+    (32
+     (emit-operand-size-prefix state 32)
+     (emit-u8 state #x81)
+     (emit-modrm-r/m state opcode-ext operand)
+     (emit-imm32 state immediate))))
 
 (defun emit-unary-register-op (state base operand width register-class)
   (let ((reg (register-code operand register-class)))
@@ -364,6 +545,127 @@
     (32
      (emit-modrm state 0 reg-field 5)
      (emit-imm32 state operand))))
+
+(defun emit-unary-rm-op (state opcode-ext operand)
+  ;; F6 / F7 with /opcode-ext targeting an 8/16/32-bit register.
+  ;; Used by NOT, NEG, MUL, DIV.
+  (cond ((dword-register-p operand)
+         (emit-operand-size-prefix state 32)
+         (emit-u8 state #xF7)
+         (emit-modrm-r/m state opcode-ext operand))
+        ((word-register-p operand)
+         (emit-operand-size-prefix state 16)
+         (emit-u8 state #xF7)
+         (emit-modrm-r/m state opcode-ext operand))
+        ((byte-register-p operand)
+         (emit-u8 state #xF6)
+         (emit-modrm-r/m state opcode-ext operand))
+        ((memory-operand-p operand)
+         (let ((width (or (memory-operand-width operand)
+                          (error "Unary memory operands require an explicit width, got ~S."
+                                 operand))))
+           (ecase width
+             (8
+              (emit-u8 state #xF6)
+              (emit-modrm-r/m state opcode-ext operand))
+             (16
+              (emit-operand-size-prefix state 16)
+              (emit-u8 state #xF7)
+              (emit-modrm-r/m state opcode-ext operand))
+             (32
+              (emit-operand-size-prefix state 32)
+              (emit-u8 state #xF7)
+              (emit-modrm-r/m state opcode-ext operand)))))
+        (t
+         (error "Operand must be a register, got ~S." operand))))
+
+(defun emit-shift-by-immediate (state opcode-ext operands)
+  (destructuring-bind (operand count) operands
+    (let ((normalized-count (cond ((integerp count) count)
+                                  (t (error "Shift count must be an immediate integer, got ~S." count)))))
+      (unless (typep normalized-count '(integer 0 255))
+        (error "Shift count must fit in 8 bits, got ~S." count))
+      (let ((width (or (operand-width operand)
+                       (memory-operand-width operand)
+                       (error "Shift requires a register or explicitly-sized memory operand, got ~S."
+                              operand))))
+        (ecase width
+          (8
+           (emit-u8 state #xC0)
+           (emit-modrm-r/m state opcode-ext operand)
+           (emit-u8 state normalized-count))
+          (16
+           (emit-operand-size-prefix state 16)
+           (emit-u8 state #xC1)
+           (emit-modrm-r/m state opcode-ext operand)
+           (emit-u8 state normalized-count))
+          (32
+           (emit-operand-size-prefix state 32)
+           (emit-u8 state #xC1)
+           (emit-modrm-r/m state opcode-ext operand)
+           (emit-u8 state normalized-count)))))))
+
+(defun emit-conditional-jump (state opcode label)
+  (emit-u8 state opcode)
+  (emit-rel8 state label))
+
+(defun emit-near-conditional-jump (state opcode label)
+  (emit-u8 state #x0F)
+  (emit-u8 state opcode)
+  (if (= (assembly-bits state) 16)
+      (emit-rel16 state label)
+      (emit-rel32 state label)))
+
+(defun emit-mov-immediate-to-r/m (state operand immediate width)
+  (when (memory-operand-p operand)
+    (ensure-memory-width operand width))
+  (ecase width
+    (8
+     (emit-u8 state #xC6)
+     (emit-modrm-r/m state 0 operand)
+     (emit-imm8 state immediate))
+    (16
+     (emit-operand-size-prefix state 16)
+     (emit-u8 state #xC7)
+     (emit-modrm-r/m state 0 operand)
+     (emit-imm16 state immediate))
+    (32
+     (emit-operand-size-prefix state 32)
+     (emit-u8 state #xC7)
+     (emit-modrm-r/m state 0 operand)
+     (emit-imm32 state immediate))))
+
+(defun emit-movx (state signedp destination source)
+  (let ((destination-width (cond ((word-register-p destination) 16)
+                                 ((dword-register-p destination) 32)
+                                 (t
+                                  (error "~A destination must be a 16-bit or 32-bit register, got ~S."
+                                         (if signedp "MOVSX" "MOVZX")
+                                         destination))))
+        (source-width (cond ((byte-register-p source) 8)
+                            ((word-register-p source) 16)
+                            ((memory-operand-p source)
+                             (or (memory-operand-width source)
+                                 (error "~A from memory requires an explicit source width, got ~S."
+                                        (if signedp "MOVSX" "MOVZX")
+                                        source)))
+                            (t
+                             (error "~A source must be a byte/word register or memory operand, got ~S."
+                                    (if signedp "MOVSX" "MOVZX")
+                                    source)))))
+    (when (and (= destination-width 16) (= source-width 16))
+      (error "~A does not support 16-bit source to 16-bit destination." (if signedp "MOVSX" "MOVZX")))
+    (emit-operand-size-prefix state destination-width)
+    (emit-u8 state #x0F)
+    (emit-u8 state (case source-width
+                     (8 (if signedp #xBE #xB6))
+                     (16 (if signedp #xBF #xB7))
+                     (t (error "Unsupported source width ~D." source-width))))
+    (emit-modrm-r/m state (register-code destination
+                                         (if (= destination-width 16)
+                                             +x86-word-registers+
+                                             +x86-dword-registers+))
+                   source)))
 
 (defun encode-instruction (state operator operands)
   (flet ((expect-arity (count)
@@ -405,33 +707,45 @@
       (:out
        (expect-arity 2)
        (destructuring-bind (port source) operands
-         (cond ((and (integerp port)
-                     (typep port '(integer 0 255))
-                     (eql (token-keyword source) :AL))
-                (emit-u8 state #xE6)
-                (emit-u8 state port))
-               ((and (typep port '(or symbol string))
-                     (eql (token-keyword port) :DX)
-                     (eql (token-keyword source) :AL))
-                (emit-u8 state #xEE))
-               (t
-                (error "OUT currently supports immediate-8 or DX ports with AL, got ~S."
-                       operands)))))
+         (let ((width (cond ((eql (token-keyword source) :AL) 8)
+                            ((eql (token-keyword source) :AX) 16)
+                            ((eql (token-keyword source) :EAX) 32)
+                            (t nil))))
+           (cond ((and width
+                       (integerp port)
+                       (typep port '(integer 0 255)))
+                  (emit-operand-size-prefix state width)
+                  (emit-u8 state (if (= width 8) #xE6 #xE7))
+                  (emit-u8 state port))
+                 ((and width
+                       (typep port '(or symbol string))
+                       (eql (token-keyword port) :DX))
+                  (emit-operand-size-prefix state width)
+                 (emit-u8 state (if (= width 8) #xEE #xEF)))
+                 (t
+                  (error "OUT currently supports AL/AX/EAX with immediate-8 or DX ports, got ~S."
+                         operands))))))
       (:in
        (expect-arity 2)
        (destructuring-bind (destination port) operands
-         (cond ((and (eql (token-keyword destination) :AL)
-                     (integerp port)
-                     (typep port '(integer 0 255)))
-                (emit-u8 state #xE4)
-                (emit-u8 state port))
-               ((and (eql (token-keyword destination) :AL)
-                     (typep port '(or symbol string))
-                     (eql (token-keyword port) :DX))
-                (emit-u8 state #xEC))
-               (t
-                (error "IN currently supports AL with immediate-8 or DX ports, got ~S."
-                       operands)))))
+         (let ((width (cond ((eql (token-keyword destination) :AL) 8)
+                            ((eql (token-keyword destination) :AX) 16)
+                            ((eql (token-keyword destination) :EAX) 32)
+                            (t nil))))
+           (cond ((and width
+                       (integerp port)
+                       (typep port '(integer 0 255)))
+                  (emit-operand-size-prefix state width)
+                  (emit-u8 state (if (= width 8) #xE4 #xE5))
+                  (emit-u8 state port))
+                 ((and width
+                       (typep port '(or symbol string))
+                       (eql (token-keyword port) :DX))
+                  (emit-operand-size-prefix state width)
+                  (emit-u8 state (if (= width 8) #xEC #xED)))
+                 (t
+                  (error "IN currently supports AL/AX/EAX with immediate-8 or DX ports, got ~S."
+                         operands))))))
       (:call
        (expect-arity 1)
        (emit-u8 state #xE8)
@@ -522,6 +836,8 @@
                 (cond ((dword-register-p source)
                        (emit-register-register state #x89 destination source
                                               +x86-dword-registers+ +x86-dword-registers+ 32))
+                      ((memory-operand-p source)
+                       (emit-register-r/m state #x8B destination source 32 +x86-dword-registers+))
                       ((control-register-p source)
                        (emit-u8 state #x0F)
                        (emit-u8 state #x20)
@@ -537,6 +853,8 @@
                 (cond ((word-register-p source)
                        (emit-register-register state #x89 destination source
                                               +x86-word-registers+ +x86-word-registers+ 16))
+                      ((memory-operand-p source)
+                       (emit-register-r/m state #x8B destination source 16 +x86-word-registers+))
                       ((segment-register-p source)
                        (emit-u8 state #x8C)
                        (emit-modrm state 3
@@ -548,13 +866,28 @@
                                                 source
                                                 16))))
                ((byte-register-p destination)
-                (if (byte-register-p source)
-                    (emit-register-register state #x88 destination source
-                                           +x86-byte-registers+ +x86-byte-registers+ 8)
-                    (emit-register-immediate state #xB0
-                                             (byte-register-p destination)
-                                             source
-                                             8)))
+                (cond ((byte-register-p source)
+                       (emit-register-register state #x88 destination source
+                                              +x86-byte-registers+ +x86-byte-registers+ 8))
+                      ((memory-operand-p source)
+                       (emit-register-r/m state #x8A destination source 8 +x86-byte-registers+))
+                      (t
+                       (emit-register-immediate state #xB0
+                                                (byte-register-p destination)
+                                                source
+                                                8))))
+               ((memory-operand-p destination)
+                (cond ((dword-register-p source)
+                       (emit-r/m-register state #x89 destination source 32 +x86-dword-registers+))
+                      ((word-register-p source)
+                       (emit-r/m-register state #x89 destination source 16 +x86-word-registers+))
+                      ((byte-register-p source)
+                       (emit-r/m-register state #x88 destination source 8 +x86-byte-registers+))
+                      (t
+                       (let ((width (or (memory-operand-width destination)
+                                        (error "MOV immediate to memory requires an explicit width, got ~S."
+                                               destination))))
+                         (emit-mov-immediate-to-r/m state destination source width)))))
                ((segment-register-p destination)
                 (unless (word-register-p source)
                   (error "MOV into segment registers requires a 16-bit register source, got ~S." source))
@@ -572,25 +905,61 @@
                             (dword-register-p source)))
                (t
                 (error "Unsupported MOV operands ~S." operands)))))
+      (:lea
+       (expect-arity 2)
+       (destructuring-bind (destination source) operands
+         (cond ((dword-register-p destination)
+                (unless (memory-operand-p source)
+                  (error "LEA requires a memory operand source, got ~S." source))
+                (emit-register-r/m state #x8D destination source 32 +x86-dword-registers+))
+               ((word-register-p destination)
+                (unless (memory-operand-p source)
+                  (error "LEA requires a memory operand source, got ~S." source))
+                (emit-register-r/m state #x8D destination source 16 +x86-word-registers+))
+               (t
+                (error "LEA requires a 16-bit or 32-bit destination register, got ~S."
+                       destination)))))
+      (:movzx
+       (expect-arity 2)
+       (emit-movx state nil (first operands) (second operands)))
+      (:movsx
+       (expect-arity 2)
+       (emit-movx state t (first operands) (second operands)))
       (:xor
        (expect-arity 2)
        (destructuring-bind (destination source) operands
          (cond ((and (dword-register-p destination) (dword-register-p source))
                 (emit-register-register state #x31 destination source
                                        +x86-dword-registers+ +x86-dword-registers+ 32))
+               ((and (dword-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x33 destination source 32 +x86-dword-registers+))
+               ((and (memory-operand-p destination) (dword-register-p source))
+                (emit-r/m-register state #x31 destination source 32 +x86-dword-registers+))
                ((and (word-register-p destination) (word-register-p source))
                 (emit-register-register state #x31 destination source
                                        +x86-word-registers+ +x86-word-registers+ 16))
+               ((and (word-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x33 destination source 16 +x86-word-registers+))
+               ((and (memory-operand-p destination) (word-register-p source))
+                (emit-r/m-register state #x31 destination source 16 +x86-word-registers+))
                ((and (byte-register-p destination) (byte-register-p source))
                 (emit-register-register state #x30 destination source
                                        +x86-byte-registers+ +x86-byte-registers+ 8))
+               ((and (byte-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x32 destination source 8 +x86-byte-registers+))
+               ((and (memory-operand-p destination) (byte-register-p source))
+                (emit-r/m-register state #x30 destination source 8 +x86-byte-registers+))
                ((or (dword-register-p destination)
                     (word-register-p destination)
-                    (byte-register-p destination))
+                    (byte-register-p destination)
+                    (memory-operand-p destination))
                 (emit-group1-immediate state 6 destination source
                                        (cond ((dword-register-p destination) 32)
                                              ((word-register-p destination) 16)
-                                             (t 8))))
+                                             ((byte-register-p destination) 8)
+                                             (t (or (memory-operand-width destination)
+                                                    (error "Immediate XOR to memory requires an explicit width, got ~S."
+                                                           destination))))))
                (t
                 (error "Unsupported XOR operands ~S." operands)))))
       (:or
@@ -599,19 +968,35 @@
          (cond ((and (dword-register-p destination) (dword-register-p source))
                 (emit-register-register state #x09 destination source
                                        +x86-dword-registers+ +x86-dword-registers+ 32))
+               ((and (dword-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x0B destination source 32 +x86-dword-registers+))
+               ((and (memory-operand-p destination) (dword-register-p source))
+                (emit-r/m-register state #x09 destination source 32 +x86-dword-registers+))
                ((and (word-register-p destination) (word-register-p source))
                 (emit-register-register state #x09 destination source
                                        +x86-word-registers+ +x86-word-registers+ 16))
+               ((and (word-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x0B destination source 16 +x86-word-registers+))
+               ((and (memory-operand-p destination) (word-register-p source))
+                (emit-r/m-register state #x09 destination source 16 +x86-word-registers+))
                ((and (byte-register-p destination) (byte-register-p source))
                 (emit-register-register state #x08 destination source
                                        +x86-byte-registers+ +x86-byte-registers+ 8))
+               ((and (byte-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x0A destination source 8 +x86-byte-registers+))
+               ((and (memory-operand-p destination) (byte-register-p source))
+                (emit-r/m-register state #x08 destination source 8 +x86-byte-registers+))
                ((or (dword-register-p destination)
                     (word-register-p destination)
-                    (byte-register-p destination))
+                    (byte-register-p destination)
+                    (memory-operand-p destination))
                 (emit-group1-immediate state 1 destination source
                                        (cond ((dword-register-p destination) 32)
                                              ((word-register-p destination) 16)
-                                             (t 8))))
+                                             ((byte-register-p destination) 8)
+                                             (t (or (memory-operand-width destination)
+                                                    (error "Immediate OR to memory requires an explicit width, got ~S."
+                                                           destination))))))
                (t
                 (error "Unsupported OR operands ~S." operands)))))
       (:and
@@ -620,19 +1005,35 @@
          (cond ((and (dword-register-p destination) (dword-register-p source))
                 (emit-register-register state #x21 destination source
                                        +x86-dword-registers+ +x86-dword-registers+ 32))
+               ((and (dword-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x23 destination source 32 +x86-dword-registers+))
+               ((and (memory-operand-p destination) (dword-register-p source))
+                (emit-r/m-register state #x21 destination source 32 +x86-dword-registers+))
                ((and (word-register-p destination) (word-register-p source))
                 (emit-register-register state #x21 destination source
                                        +x86-word-registers+ +x86-word-registers+ 16))
+               ((and (word-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x23 destination source 16 +x86-word-registers+))
+               ((and (memory-operand-p destination) (word-register-p source))
+                (emit-r/m-register state #x21 destination source 16 +x86-word-registers+))
                ((and (byte-register-p destination) (byte-register-p source))
                 (emit-register-register state #x20 destination source
                                        +x86-byte-registers+ +x86-byte-registers+ 8))
+               ((and (byte-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x22 destination source 8 +x86-byte-registers+))
+               ((and (memory-operand-p destination) (byte-register-p source))
+                (emit-r/m-register state #x20 destination source 8 +x86-byte-registers+))
                ((or (dword-register-p destination)
                     (word-register-p destination)
-                    (byte-register-p destination))
+                    (byte-register-p destination)
+                    (memory-operand-p destination))
                 (emit-group1-immediate state 4 destination source
                                        (cond ((dword-register-p destination) 32)
                                              ((word-register-p destination) 16)
-                                             (t 8))))
+                                             ((byte-register-p destination) 8)
+                                             (t (or (memory-operand-width destination)
+                                                    (error "Immediate AND to memory requires an explicit width, got ~S."
+                                                           destination))))))
                (t
                 (error "Unsupported AND operands ~S." operands)))))
       (:cmp
@@ -641,19 +1042,354 @@
          (cond ((and (dword-register-p destination) (dword-register-p source))
                 (emit-register-register state #x39 destination source
                                        +x86-dword-registers+ +x86-dword-registers+ 32))
+               ((and (dword-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x3B destination source 32 +x86-dword-registers+))
+               ((and (memory-operand-p destination) (dword-register-p source))
+                (emit-r/m-register state #x39 destination source 32 +x86-dword-registers+))
                ((and (word-register-p destination) (word-register-p source))
                 (emit-register-register state #x39 destination source
                                        +x86-word-registers+ +x86-word-registers+ 16))
+               ((and (word-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x3B destination source 16 +x86-word-registers+))
+               ((and (memory-operand-p destination) (word-register-p source))
+                (emit-r/m-register state #x39 destination source 16 +x86-word-registers+))
                ((and (byte-register-p destination) (byte-register-p source))
                 (emit-register-register state #x38 destination source
                                        +x86-byte-registers+ +x86-byte-registers+ 8))
+               ((and (byte-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x3A destination source 8 +x86-byte-registers+))
+               ((and (memory-operand-p destination) (byte-register-p source))
+                (emit-r/m-register state #x38 destination source 8 +x86-byte-registers+))
                ((dword-register-p destination)
                 (emit-group1-immediate state 7 destination source 32))
                ((word-register-p destination)
                 (emit-group1-immediate state 7 destination source 16))
                ((byte-register-p destination)
                 (emit-group1-immediate state 7 destination source 8))
+               ((memory-operand-p destination)
+                (emit-group1-immediate state 7 destination source
+                                       (or (memory-operand-width destination)
+                                           (error "Immediate CMP to memory requires an explicit width, got ~S."
+                                                  destination))))
                (t
                 (error "Unsupported CMP operands ~S." operands)))))
+      (:add
+       (expect-arity 2)
+       (destructuring-bind (destination source) operands
+         (cond ((and (dword-register-p destination) (dword-register-p source))
+                (emit-register-register state #x01 destination source
+                                       +x86-dword-registers+ +x86-dword-registers+ 32))
+               ((and (dword-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x03 destination source 32 +x86-dword-registers+))
+               ((and (memory-operand-p destination) (dword-register-p source))
+                (emit-r/m-register state #x01 destination source 32 +x86-dword-registers+))
+               ((and (word-register-p destination) (word-register-p source))
+                (emit-register-register state #x01 destination source
+                                       +x86-word-registers+ +x86-word-registers+ 16))
+               ((and (word-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x03 destination source 16 +x86-word-registers+))
+               ((and (memory-operand-p destination) (word-register-p source))
+                (emit-r/m-register state #x01 destination source 16 +x86-word-registers+))
+               ((and (byte-register-p destination) (byte-register-p source))
+                (emit-register-register state #x00 destination source
+                                       +x86-byte-registers+ +x86-byte-registers+ 8))
+               ((and (byte-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x02 destination source 8 +x86-byte-registers+))
+               ((and (memory-operand-p destination) (byte-register-p source))
+                (emit-r/m-register state #x00 destination source 8 +x86-byte-registers+))
+               ((dword-register-p destination)
+                (emit-group1-immediate state 0 destination source 32))
+               ((word-register-p destination)
+                (emit-group1-immediate state 0 destination source 16))
+               ((byte-register-p destination)
+                (emit-group1-immediate state 0 destination source 8))
+               ((memory-operand-p destination)
+                (emit-group1-immediate state 0 destination source
+                                       (or (memory-operand-width destination)
+                                           (error "Immediate ADD to memory requires an explicit width, got ~S."
+                                                  destination))))
+               (t
+                (error "Unsupported ADD operands ~S." operands)))))
+      (:sub
+       (expect-arity 2)
+       (destructuring-bind (destination source) operands
+         (cond ((and (dword-register-p destination) (dword-register-p source))
+                (emit-register-register state #x29 destination source
+                                       +x86-dword-registers+ +x86-dword-registers+ 32))
+               ((and (dword-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x2B destination source 32 +x86-dword-registers+))
+               ((and (memory-operand-p destination) (dword-register-p source))
+                (emit-r/m-register state #x29 destination source 32 +x86-dword-registers+))
+               ((and (word-register-p destination) (word-register-p source))
+                (emit-register-register state #x29 destination source
+                                       +x86-word-registers+ +x86-word-registers+ 16))
+               ((and (word-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x2B destination source 16 +x86-word-registers+))
+               ((and (memory-operand-p destination) (word-register-p source))
+                (emit-r/m-register state #x29 destination source 16 +x86-word-registers+))
+               ((and (byte-register-p destination) (byte-register-p source))
+                (emit-register-register state #x28 destination source
+                                       +x86-byte-registers+ +x86-byte-registers+ 8))
+               ((and (byte-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x2A destination source 8 +x86-byte-registers+))
+               ((and (memory-operand-p destination) (byte-register-p source))
+                (emit-r/m-register state #x28 destination source 8 +x86-byte-registers+))
+               ((dword-register-p destination)
+                (emit-group1-immediate state 5 destination source 32))
+               ((word-register-p destination)
+                (emit-group1-immediate state 5 destination source 16))
+               ((byte-register-p destination)
+                (emit-group1-immediate state 5 destination source 8))
+               ((memory-operand-p destination)
+                (emit-group1-immediate state 5 destination source
+                                       (or (memory-operand-width destination)
+                                           (error "Immediate SUB to memory requires an explicit width, got ~S."
+                                                  destination))))
+               (t
+                (error "Unsupported SUB operands ~S." operands)))))
+      (:test
+       (expect-arity 2)
+       (destructuring-bind (destination source) operands
+         (cond ((and (dword-register-p destination) (dword-register-p source))
+                (emit-register-register state #x85 destination source
+                                       +x86-dword-registers+ +x86-dword-registers+ 32))
+               ((and (dword-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x85 destination source 32 +x86-dword-registers+))
+               ((and (memory-operand-p destination) (dword-register-p source))
+                (emit-r/m-register state #x85 destination source 32 +x86-dword-registers+))
+               ((and (word-register-p destination) (word-register-p source))
+                (emit-register-register state #x85 destination source
+                                       +x86-word-registers+ +x86-word-registers+ 16))
+               ((and (word-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x85 destination source 16 +x86-word-registers+))
+               ((and (memory-operand-p destination) (word-register-p source))
+                (emit-r/m-register state #x85 destination source 16 +x86-word-registers+))
+               ((and (byte-register-p destination) (byte-register-p source))
+                (emit-register-register state #x84 destination source
+                                       +x86-byte-registers+ +x86-byte-registers+ 8))
+               ((and (byte-register-p destination) (memory-operand-p source))
+                (emit-register-r/m state #x84 destination source 8 +x86-byte-registers+))
+               ((and (memory-operand-p destination) (byte-register-p source))
+                (emit-r/m-register state #x84 destination source 8 +x86-byte-registers+))
+               ((dword-register-p destination)
+                (emit-operand-size-prefix state 32)
+                (emit-u8 state #xF7)
+                (emit-modrm-r/m state 0 destination)
+                (emit-imm32 state source))
+               ((word-register-p destination)
+                (emit-operand-size-prefix state 16)
+                (emit-u8 state #xF7)
+                (emit-modrm-r/m state 0 destination)
+                (emit-imm16 state source))
+               ((byte-register-p destination)
+                (emit-u8 state #xF6)
+                (emit-modrm-r/m state 0 destination)
+                (emit-imm8 state source))
+               ((memory-operand-p destination)
+                (let ((width (or (memory-operand-width destination)
+                                 (error "Immediate TEST to memory requires an explicit width, got ~S."
+                                        destination))))
+                  (ecase width
+                    (8
+                     (emit-u8 state #xF6)
+                     (emit-modrm-r/m state 0 destination)
+                     (emit-imm8 state source))
+                    (16
+                     (emit-operand-size-prefix state 16)
+                     (emit-u8 state #xF7)
+                     (emit-modrm-r/m state 0 destination)
+                     (emit-imm16 state source))
+                    (32
+                     (emit-operand-size-prefix state 32)
+                     (emit-u8 state #xF7)
+                     (emit-modrm-r/m state 0 destination)
+                     (emit-imm32 state source)))))
+               (t
+                (error "Unsupported TEST operands ~S." operands)))))
+      (:shl
+       (expect-arity 2)
+       (emit-shift-by-immediate state 4 operands))
+      (:shr
+       (expect-arity 2)
+       (emit-shift-by-immediate state 5 operands))
+      (:stosb
+       (expect-arity 0)
+       (emit-u8 state #xAA))
+      (:stosd
+       (expect-arity 0)
+       (emit-operand-size-prefix state 32)
+       (emit-u8 state #xAB))
+      (:movsd
+       (expect-arity 0)
+       (emit-operand-size-prefix state 32)
+       (emit-u8 state #xA5))
+      (:rep
+       (expect-arity 1)
+       (emit-u8 state #xF3)
+       (encode-instruction state (first operands) '()))
+      (:cpuid
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #xA2))
+      (:rdtsc
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x31))
+      (:pusha
+       (expect-arity 0)
+       (emit-u8 state #x60))
+      (:pushad
+       (expect-arity 0)
+       (emit-u8 state #x60))
+      (:popa
+       (expect-arity 0)
+       (emit-u8 state #x61))
+      (:popad
+       (expect-arity 0)
+       (emit-u8 state #x61))
+      (:pushfd
+       (expect-arity 0)
+       (emit-u8 state #x9C))
+      (:popfd
+       (expect-arity 0)
+       (emit-u8 state #x9D))
+      (:mul
+       (expect-arity 1)
+       (emit-unary-rm-op state 4 (first operands)))
+      (:div
+       (expect-arity 1)
+       (emit-unary-rm-op state 6 (first operands)))
+      (:not
+       (expect-arity 1)
+       (emit-unary-rm-op state 2 (first operands)))
+      (:neg
+       (expect-arity 1)
+       (emit-unary-rm-op state 3 (first operands)))
+      (:xchg
+       (expect-arity 2)
+       (destructuring-bind (left right) operands
+         (let ((width (or (operand-width left)
+                          (operand-width right)
+                          (memory-operand-width left)
+                          (memory-operand-width right)
+                          (error "XCHG requires at least one register or explicitly-sized memory operand, got ~S."
+                                 operands))))
+           (ecase width
+             (8
+              (cond ((byte-register-p right)
+                     (emit-r/m-register state #x86 left right 8 +x86-byte-registers+))
+                    ((byte-register-p left)
+                     (emit-r/m-register state #x86 right left 8 +x86-byte-registers+))
+                    (t
+                     (error "XCHG byte form requires a byte register operand, got ~S." operands))))
+             (16
+              (cond ((word-register-p right)
+                     (emit-r/m-register state #x87 left right 16 +x86-word-registers+))
+                    ((word-register-p left)
+                     (emit-r/m-register state #x87 right left 16 +x86-word-registers+))
+                    (t
+                     (error "XCHG word form requires a 16-bit register operand, got ~S." operands))))
+             (32
+              (cond ((dword-register-p right)
+                     (emit-r/m-register state #x87 left right 32 +x86-dword-registers+))
+                    ((dword-register-p left)
+                     (emit-r/m-register state #x87 right left 32 +x86-dword-registers+))
+                    (t
+                     (error "XCHG dword form requires a 32-bit register operand, got ~S."
+                            operands))))))))
+      (:loop
+       (expect-arity 1)
+       (emit-u8 state #xE2)
+       (emit-rel8 state (first operands)))
+      (:je
+       (expect-arity 1)
+       (emit-conditional-jump state #x74 (first operands)))
+      (:jne
+       (expect-arity 1)
+       (emit-conditional-jump state #x75 (first operands)))
+      (:jb
+       (expect-arity 1)
+       (emit-conditional-jump state #x72 (first operands)))
+      (:jnb
+       (expect-arity 1)
+       (emit-conditional-jump state #x73 (first operands)))
+      (:jae
+       (expect-arity 1)
+       (emit-conditional-jump state #x73 (first operands)))
+      (:jbe
+       (expect-arity 1)
+       (emit-conditional-jump state #x76 (first operands)))
+      (:ja
+       (expect-arity 1)
+       (emit-conditional-jump state #x77 (first operands)))
+      (:js
+       (expect-arity 1)
+       (emit-conditional-jump state #x78 (first operands)))
+      (:jns
+       (expect-arity 1)
+       (emit-conditional-jump state #x79 (first operands)))
+      (:jl
+       (expect-arity 1)
+       (emit-conditional-jump state #x7C (first operands)))
+      (:jge
+       (expect-arity 1)
+       (emit-conditional-jump state #x7D (first operands)))
+      (:jle
+       (expect-arity 1)
+       (emit-conditional-jump state #x7E (first operands)))
+      (:jg
+       (expect-arity 1)
+       (emit-conditional-jump state #x7F (first operands)))
+      (:jz-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x84 (first operands)))
+      (:jnz-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x85 (first operands)))
+      (:je-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x84 (first operands)))
+      (:jne-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x85 (first operands)))
+      (:jc-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x82 (first operands)))
+      (:jnc-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x83 (first operands)))
+      (:jb-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x82 (first operands)))
+      (:jnb-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x83 (first operands)))
+      (:jae-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x83 (first operands)))
+      (:jbe-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x86 (first operands)))
+      (:ja-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x87 (first operands)))
+      (:js-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x88 (first operands)))
+      (:jns-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x89 (first operands)))
+      (:jl-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x8C (first operands)))
+      (:jge-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x8D (first operands)))
+      (:jle-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x8E (first operands)))
+      (:jg-near
+       (expect-arity 1)
+       (emit-near-conditional-jump state #x8F (first operands)))
       (t
        (error "Unknown instruction ~S." operator)))))

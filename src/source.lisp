@@ -70,3 +70,24 @@
          (images (load-os-source source))
          (designator (select-os-image source image images)))
     (build-image-file designator (or output (default-os-image-output source)))))
+
+(defun include (&rest pathnames)
+  "Load further Bootwright source files into the current load context.
+
+Pathnames are resolved relative to the file currently being loaded; the
+default file type `.bwo' is supplied if missing.  Forms in the included
+file run in the same package and load context as the caller, so any
+DEFOS, DEFUN, DEFPARAMETER, or DEFMACRO they introduce becomes visible to
+the file that called INCLUDE."
+  (let* ((source-pathname (or *load-truename* *load-pathname*
+                              (error "INCLUDE must be called inside a Bootwright source LOAD.")))
+         (source-dir (make-pathname :name nil :type nil :defaults source-pathname)))
+    (dolist (designator pathnames)
+      (let* ((requested (pathname designator))
+             (target (merge-pathnames requested source-dir))
+             (resolved (if (pathname-type target)
+                           target
+                           (make-pathname :type *bootwright-source-type*
+                                          :defaults target))))
+        (load resolved :verbose nil :print nil))))
+  (values))

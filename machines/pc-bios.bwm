@@ -1,0 +1,29 @@
+(defmachine pc-bios
+  (:isa :x86-32)
+  (:boot-protocol :bios-mbr
+    :load-address #x7C00
+    :sector-size 512
+    :kernel-segment #x1000
+    :signature #xAA55)
+  (:memory
+    (region :name conventional :start #x00000 :end #x9FFFF :type :ram)
+    (region :name vga-text :start #xB8000 :end #xBFFFF :type :mmio)
+    (region :name bios-rom :start #xF0000 :end #xFFFFF :type :rom))
+  (:interrupt-controller
+    (pic8259 :master-base #x20
+             :slave-base #xA0
+             :master-mask-port #x21
+             :slave-mask-port #xA1
+             :vector-base 32
+             :slave-identity 2))
+  (:timer
+    (pit8253 :channel0-port #x40
+             :channel1-port #x41
+             :channel2-port #x42
+             :control-port #x43
+             :irq 0
+             :base-frequency 1193182))
+  (:serial
+    (uart16550 :name com1 :base-port #x3F8 :irq 4 :baud 115200 :divisor 1))
+  (:framebuffer
+    (vga-text :name screen0 :columns 80 :rows 25 :base-address #xB8000 :default-attribute #x07)))

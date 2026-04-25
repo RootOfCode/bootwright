@@ -1,0 +1,87 @@
+;;;; Bootwright CPU info dump.
+;;;;
+;;;; Issues CPUID(0) and CPUID(1) at boot, then renders the live result on
+;;;; screen: the 12-character vendor string (EBX/EDX/ECX from leaf 0), the
+;;;; max-supported leaf (EAX from leaf 0), the family/model/stepping
+;;;; signature (EAX from leaf 1), and the two feature-flag dwords (EDX/ECX
+;;;; from leaf 1).  The values displayed are real CPU identification, not
+;;;; static text, and will change with the underlying hardware or QEMU
+;;;; -cpu option.
+(use-machine #P"../machines/pc-bios.bwm")
+
+(defos *cpu-info* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading cpuinfo demo
+")
+      (bios-print "Bootwright stage 1: loading CPUID dump...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode  "Stage 1 ok. Entering protected mode...")
+    (string label-vendor    "Vendor string  :")
+    (string label-max-leaf  "Max CPUID leaf :")
+    (string label-signature "Signature      :")
+    (string label-feat-edx  "Features (EDX) :")
+    (string label-feat-ecx  "Features (ECX) :")
+    (string label-help      "Sampled once at boot via CPUID(0) and CPUID(1).")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry cpuinfo-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine cpuinfo-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 11
+                                :attribute #x1E
+                                :title "Bootwright CPU info")
+      (framebuffer-print-at screen0 label-vendor    :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-max-leaf  :row 4 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-signature :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-feat-edx  :row 6 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-feat-ecx  :row 7 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help      :row 9 :column 2 :attribute #x2E)
+      ;; --- CPUID leaf 0: vendor string + max supported leaf ---
+      (mov eax 0)
+      (cpuid)
+      ;; The helpers preserve EBX/ECX/EDX, but the wrapper writes AH for
+      ;; the attribute and EAX[15:8] gets clobbered, so save EAX first.
+      (push eax)
+      (vga-print-ascii4 ebx :row 3 :column 19 :attribute #x4F)
+      (vga-print-ascii4 edx :row 3 :column 23 :attribute #x4F)
+      (vga-print-ascii4 ecx :row 3 :column 27 :attribute #x4F)
+      (pop eax)
+      (vga-print-hex eax :row 4 :column 19 :attribute #x2F)
+      ;; --- CPUID leaf 1: signature + feature flags ---
+      (mov eax 1)
+      (cpuid)
+      ;; Stash the three values we want to display.
+      (push eax)
+      (push edx)
+      (push ecx)
+      (pop ecx)
+      (vga-print-hex ecx :row 7 :column 19 :attribute #x2F)
+      (pop edx)
+      (vga-print-hex edx :row 6 :column 19 :attribute #x2F)
+      (pop eax)
+      (vga-print-hex eax :row 5 :column 19 :attribute #x2F)
+      (vga-set-cursor :row 24 :column 79)
+      (debug-print "kernel: cpuinfo dump complete
+")
+      (idle-forever))))

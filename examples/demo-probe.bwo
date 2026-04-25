@@ -1,0 +1,123 @@
+;;;; Bootwright system probe.
+;;;;
+;;;; A tiny diagnostic OS: enters protected mode, reads CR0, prints the
+;;;; live machine state to the VGA console and mirrors a structured boot
+;;;; log to COM1.  IRQ0 then ticks a 32-bit uptime counter on screen and
+;;;; emits a "tick" line over serial each quarter second.
+;;;;
+;;;; Run headless to capture the log: pass -serial stdio to QEMU.
+(use-machine #P"../machines/pc-bios.bwm")
+
+(defos *system-probe* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "probe: stage1 loading kernel
+")
+      (bios-print "Bootwright stage 1: loading system probe...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "probe: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode "Stage 1 ok. Entering protected mode...")
+    (string serial-online "[probe] COM1 online @ 38400 8N1
+")
+    (string serial-cr0    "[probe] CR0 sampled (see VGA, row 3)
+")
+    (string serial-armed  "[probe] PIT 20 Hz armed; idling.
+")
+    (string serial-tick   "[probe] +1 s
+")
+    (string label-cr0    "CR0 register :")
+    (string label-magic  "Boot magic   :")
+    (string label-uptime "Uptime ticks :")
+    (string label-help-1 "Boot log mirrored to COM1 (-serial stdio).")
+    (string label-help-2 "880 Hz beep silenced after one second by IRQ0.")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry probe-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine probe-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (irq-remap :master-mask #xFF :slave-mask #xFF)
+      (load-idt idt-descriptor)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 11
+                                :attribute #x1E
+                                :title "Bootwright system probe")
+      (uart-init com1)
+      (uart-print com1 serial-online)
+      (framebuffer-print-at screen0 label-cr0    :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-magic  :row 4 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-uptime :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help-1 :row 7 :column 2 :attribute #x2E)
+      (framebuffer-print-at screen0 label-help-2 :row 8 :column 2 :attribute #x2E)
+      ;; Sample CR0 and report it on screen.
+      (mov eax cr0)
+      (vga-print-hex eax :row 3 :column 25 :attribute #x4F)
+      (uart-print com1 serial-cr0)
+      ;; Static handshake value via the literal-source code path.
+      (vga-print-hex #xCAFEBABE :row 4 :column 25 :attribute #x4F)
+      ;; Park the BIOS cursor in the corner so it does not blink over data.
+      (vga-set-cursor :row 24 :column 79)
+      ;; Audible "boot complete" cue, silenced shortly after by IRQ0.
+      (pc-speaker-tone 880)
+      (timer-set-frequency 20 :channel 0)
+      (irq-unmask 0)
+      (uart-print com1 serial-armed)
+      (debug-print "probe: armed and idling
+")
+      ;; EBX = total tick count, ECX = ticks remaining until the next second.
+      (mov ebx 0)
+      (mov ecx 20)
+      (sti)
+      (label idle-loop)
+      (hlt)
+      (jmp idle-loop))
+    (routine timer-interrupt
+      ;; EBX and ECX persist across handler calls and are not pushed.
+      (push eax)
+      (push edx)
+      (push edi)
+      (push esi)
+      (add ebx 1)
+      (vga-print-hex ebx :row 5 :column 25 :attribute #x2F)
+      ;; Silence the boot beep at the first full-second boundary.
+      (cmp ebx 20)
+      (jne after-speaker)
+      (pc-speaker-off)
+      (label after-speaker)
+      ;; Emit one serial line per real second.
+      (sub ecx 1)
+      (jnz tick-done)
+      (mov ecx 20)
+      (uart-print com1 serial-tick)
+      (label tick-done)
+      (irq-end-of-interrupt 0)
+      (pop esi)
+      (pop edi)
+      (pop edx)
+      (pop eax)
+      (iret))
+    (routine default-interrupt
+      (push eax)
+      (debug-print "probe: unexpected interrupt
+")
+      (pop eax)
+      (hang))
+    (idt idt (:pointer idt-descriptor :selector #x08 :default default-interrupt)
+      (:entry #x20 timer-interrupt))))

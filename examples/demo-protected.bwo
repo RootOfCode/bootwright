@@ -1,4 +1,6 @@
-(defos *protected-mode-demo* (:target (:x86-bios :kernel-segment #x1000))
+(use-machine #P"../machines/pc-bios.bwm")
+
+(defos *protected-mode-demo* (:machine pc-bios)
   (boot-sector (:entry boot)
     (routine boot
       (initialize-real-mode :stack #x7C00)
@@ -47,7 +49,7 @@
     (bits 32)
     (routine protected-main
       (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
-      (pic-remap :master-mask #xFF :slave-mask #xFF)
+      (irq-remap :master-mask #xFF :slave-mask #xFF)
       (load-idt idt-descriptor)
       (enable-paging :page-directory page-directory :cr4-mask #x10)
       (cmp esi boot-info)
@@ -55,18 +57,18 @@
       (debug-print debug-boot-mismatch)
       (hang)
       (label boot-info-ok)
-      (clear-vga :attribute #x17)
-      (vga-box :row 0 :column 0 :width 42 :height 8
-               :attribute #x1E
-               :title "Bootwright protected demo")
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 42 :height 8
+                                :attribute #x1E
+                                :title "Bootwright protected demo")
       (debug-print debug-pmode-ready)
-      (vga-print-at screen-ready :row 2 :column 2 :attribute #x1A)
-      (vga-print-at screen-handoff :row 3 :column 2 :attribute #x1A)
-      (vga-print-at screen-interrupt :row 4 :column 2 :attribute #x1F)
+      (framebuffer-print-at screen0 screen-ready :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 screen-handoff :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 screen-interrupt :row 4 :column 2 :attribute #x1F)
       (int #x30)
       (debug-print debug-int-returned)
-      (vga-print-at screen-returned :row 5 :column 2 :attribute #x2F)
-      (vga-print-at screen-parked :row 6 :column 2 :attribute #x2E)
+      (framebuffer-print-at screen0 screen-returned :row 5 :column 2 :attribute #x2F)
+      (framebuffer-print-at screen0 screen-parked :row 6 :column 2 :attribute #x2E)
       (hang))
     (routine default-interrupt
       (push eax)

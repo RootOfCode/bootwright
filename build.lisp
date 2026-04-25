@@ -9,7 +9,11 @@
     (dolist (spec '(("examples/demo-real.bwo" "out/bootwright-demo.img")
                     ("examples/demo-protected.bwo" "out/bootwright-protected.img")
                     ("examples/demo-assets.bwo" "out/bootwright-assets.img")
-                    ("examples/demo-timer.bwo" "out/bootwright-timer.img")))
+                    ("examples/demo-timer.bwo" "out/bootwright-timer.img")
+                    ("examples/demo-probe.bwo" "out/bootwright-probe.img")
+                    ("examples/demo-cpuinfo.bwo" "out/bootwright-cpuinfo.img")
+                    ("examples/demo-bench.bwo" "out/bootwright-bench.img")
+                    ("examples/demo-memops.bwo" "out/bootwright-memops.img")))
       (destructuring-bind (source output) spec
         (let ((pathname (funcall builder
                                  (merge-pathnames source root)

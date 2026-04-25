@@ -1,0 +1,90 @@
+;;;; Bootwright boot benchmark.
+;;;;
+;;;; Computes the 32-bit Fibonacci F(20) in protected mode and reports how
+;;;; many CPU cycles the workload took, sampled with RDTSC before and
+;;;; after the loop.  Demonstrates: RDTSC, the new MUL/DIV/NOT/NEG/LOOP/
+;;;; PUSHA/POPA assembler ops (vga-print-decimal uses DIV internally),
+;;;; multi-file source composition via INCLUDE, and zero-padded decimal
+;;;; output via vga-print-decimal.
+;;;;
+;;;; In QEMU TCG, the cycle count is typical of the emulator's clock
+;;;; backend rather than a real CPU; on KVM/baremetal it is real CPU
+;;;; cycles.
+
+(use-machine #P"../machines/pc-bios.bwm")
+(include "lib/gdt-flat.bwo")
+
+(defos *boot-bench* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading boot bench
+")
+      (bios-print "Bootwright stage 1: loading boot bench...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode    "Stage 1 ok. Entering protected mode...")
+    (string label-workload  "Workload   :")
+    (string label-fib-n     "F(20) hex  :")
+    (string label-iters     "Iterations :")
+    (string label-cycles    "TSC delta  :")
+    (string label-units     "(decimal cycles, low 32 bits of RDTSC delta)")
+    (string label-help      "RDTSC sampled before/after a 20-step Fibonacci loop.")
+    (string workload-text   "32-bit iterative Fibonacci")
+    ;; Pulled from lib/gdt-flat.bwo via INCLUDE + read-time eval.
+    #.(flat-gdt 'gdt :pointer 'gdt-descriptor)
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry bench-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine bench-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 12
+                                :attribute #x1E
+                                :title "Bootwright boot bench")
+      (framebuffer-print-at screen0 label-workload  :row 2 :column 2  :attribute #x1A)
+      (framebuffer-print-at screen0 workload-text   :row 2 :column 16 :attribute #x1F)
+      (framebuffer-print-at screen0 label-iters     :row 3 :column 2  :attribute #x1A)
+      (vga-print-decimal 20         :row 3 :column 16 :attribute #x2F)
+      (framebuffer-print-at screen0 label-fib-n     :row 4 :column 2  :attribute #x1A)
+      (framebuffer-print-at screen0 label-cycles    :row 6 :column 2  :attribute #x1A)
+      (framebuffer-print-at screen0 label-units     :row 7 :column 16 :attribute #x2E)
+      (framebuffer-print-at screen0 label-help      :row 9 :column 2  :attribute #x2E)
+      ;; --- Workload ---
+      ;; EBX = a, ECX = b, EDI = iteration counter, EBP = result, ESI = TSC start.
+      (mov ebx 0)
+      (mov ecx 1)
+      (mov edi 20)
+      (rdtsc)
+      (mov esi eax)        ; ESI = TSC low at start
+      (label fib-loop)
+      (mov edx ebx)
+      (add edx ecx)        ; edx = a + b
+      (mov ebx ecx)        ; a = b
+      (mov ecx edx)        ; b = edx
+      (dec edi)
+      (jnz fib-loop)
+      (mov ebp ebx)        ; EBP = F(20).  (After k iterations, EBX = F(k).)
+      (rdtsc)
+      (sub eax esi)        ; EAX = cycles elapsed (low 32 bits)
+      (mov esi eax)        ; ESI = cycle delta
+      ;; --- Render ---
+      (vga-print-hex     ebp :row 4 :column 16 :attribute #x4F)
+      (vga-print-decimal esi :row 6 :column 16 :attribute #x4F)
+      (vga-set-cursor :row 24 :column 79)
+      (debug-print "kernel: bench complete
+")
+      (idle-forever))))

@@ -1,4 +1,6 @@
-(defos *demo-os* (:target (:x86-bios :kernel-segment #x1000))
+(use-machine #P"../machines/pc-bios.bwm")
+
+(defos *demo-os* (:machine pc-bios)
   (boot-sector (:entry boot)
     (routine boot
       (initialize-real-mode :stack #x7C00)
