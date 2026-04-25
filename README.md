@@ -161,7 +161,7 @@ qemu-system-i386 \
 
 ## Example Notes
 
-- `demo-assets.bwo` shows `include-binary` loading [kernel-banner.txt](/home/bruno/Documentos/codex/bootwright/examples/assets/kernel-banner.txt) relative to the source file.
+- `demo-assets.bwo` shows `include-binary` loading [kernel-banner.txt](/examples/assets/kernel-banner.txt) relative to the source file.
 - `demo-protected.bwo` uses the machine-backed `framebuffer-*` and `irq-remap` forms for its protected-mode status panel.
 - `demo-timer.bwo` uses the generic `timer-set-frequency`, `irq-unmask`, and `irq-end-of-interrupt` forms and keeps a live `MM:SS` timer updated on the VGA screen from IRQ0.
 - `demo-probe.bwo` reads the live `CR0` value via `mov eax, cr0`, prints it with `vga-print-hex`, mirrors a labelled boot log over COM1 via `uart-init`/`uart-print` (run with `-serial stdio` to capture), beeps once via `pc-speaker-tone`, and parks the VGA hardware cursor in the corner.
