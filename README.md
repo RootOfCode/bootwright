@@ -47,6 +47,7 @@ The included examples are:
 - [demo-sysinstr.bwo](examples/cpu/demo-sysinstr.bwo) — exercises CPL=0 system instructions: `RDMSR(IA32_TSC)`, an atomic `LOCK ADD` on a counter, `INVLPG` via `tlb-flush-page`, `MOV CR3,CR3` via `tlb-flush-all`, and `MFENCE` via `memory-barrier`.
 - [demo-keyboard.bwo](examples/devices/demo-keyboard.bwo) — interactive PS/2 keyboard echo: declares a `keyboard-driver`, wires IRQ1, blocks on `keyboard-read`, then mirrors each pressed key to a VGA cell and to debugcon. Run in a QEMU window and type.
 - [demo-ata.bwo](examples/devices/demo-ata.bwo) — declares a primary-bus ATA-PIO LBA28 `block-device`, reads sector 0 of the IDE companion disk, and verifies the `0xAA55` boot signature.
+- [demo-memmap.bwo](examples/devices/demo-memmap.bwo) — declares a `memory-map` backed by INT 15h E820, runs `memory-map-probe` in real mode before `enter-protected-mode`, then renders the entry count plus the first region's base/length/type on screen.
 
 ## DSL Features
 
@@ -77,6 +78,7 @@ Bootwright currently supports:
 - ISA-generic memory and TLB primitives via `memory-barrier` (`:load`/`:store`/full), `tlb-flush-page`, `tlb-flush-all`, and `load-tr` (Phase 4 starter set).
 - PS/2 keyboard support via `keyboard-driver` (declares ring buffer + scancode table + IRQ1 handler), `keyboard-read` (blocking), and `keyboard-poll` (non-blocking with `:empty` jump target). US-QWERTY scancode set 1; user wires the handler in their own IDT.
 - ATA-PIO LBA28 disk support via `block-device` (primary/secondary bus, 512-byte sectors), `block-read` (sector → buffer), and `block-write` (buffer → sector + cache flush). The bundled testing harness attaches every image as both floppy (boot) and IDE master (data), so `block-read` against the image's own sector 0 round-trips the boot signature.
+- BIOS E820 memory probing via `memory-map` (declares count + entry buffer), `memory-map-probe` (real-mode INT 15h fill), `memory-map-base` / `memory-map-count` (load entries pointer / count into a register).
 - Bootwright-native source loading/building through `load-os-source` and `build-os-source-file`.
 - Headless QEMU verification via `test-os` and `test-os-source-file`.
 - Multi-file source composition via `(include "other.bwo" ...)` — includes are resolved relative to the calling file and run in the same package, so a library file can define Lisp helpers that the main file splices into a `defos` body with `#.` (read-time eval).
@@ -114,17 +116,18 @@ sbcl --script build.lisp
 
 That writes:
 
-- `out/bootwright-demo.img`
-- `out/bootwright-protected.img`
-- `out/bootwright-assets.img`
-- `out/bootwright-timer.img`
-- `out/bootwright-probe.img`
-- `out/bootwright-cpuinfo.img`
-- `out/bootwright-bench.img`
-- `out/bootwright-memops.img`
-- `out/bootwright-sysinstr.img`
-- `out/bootwright-keyboard.img`
-- `out/bootwright-ata.img`
+- `out/basics/bootwright-demo.img`
+- `out/protected/bootwright-protected.img`
+- `out/basics/bootwright-assets.img`
+- `out/devices/bootwright-timer.img`
+- `out/devices/bootwright-probe.img`
+- `out/cpu/bootwright-cpuinfo.img`
+- `out/cpu/bootwright-bench.img`
+- `out/cpu/bootwright-memops.img`
+- `out/cpu/bootwright-sysinstr.img`
+- `out/devices/bootwright-keyboard.img`
+- `out/devices/bootwright-ata.img`
+- `out/devices/bootwright-memmap.img`
 
 You can also build a `.bwo` file directly from Lisp:
 
@@ -156,7 +159,7 @@ sbcl --script test.lisp
 Normal VGA window:
 
 ```bash
-qemu-system-i386 -drive format=raw,file=out/bootwright-protected.img,if=floppy
+qemu-system-i386 -drive format=raw,file=out/protected/bootwright-protected.img,if=floppy
 ```
 
 Headless debug output:
@@ -164,7 +167,7 @@ Headless debug output:
 ```bash
 qemu-system-i386 \
   -display none \
-  -drive format=raw,file=out/bootwright-protected.img,if=floppy \
+  -drive format=raw,file=out/protected/bootwright-protected.img,if=floppy \
   -monitor none -serial none -parallel none \
   -global isa-debugcon.iobase=0xe9 \
   -debugcon stdio
@@ -182,3 +185,4 @@ qemu-system-i386 \
 - `demo-sysinstr.bwo` issues `RDMSR(0x10)`, builds an atomic counter with `LOCK ADD` followed by `MEMORY-BARRIER`, then runs `TLB-FLUSH-PAGE`/`TLB-FLUSH-ALL` to exercise the Phase 4 memory and TLB primitives.
 - `demo-keyboard.bwo` is interactive: it remaps the PIC to unmask IRQ1 only, hands off to a `keyboard-driver`-emitted scancode handler, and runs `keyboard-read` in a tight loop that echoes each typed character to row 2 column 22 and to debugcon. Verified under QEMU by sending `sendkey a b c ret` through the monitor pipe.
 - `demo-ata.bwo` issues a one-sector ATA-PIO read of LBA 0 (boot sector of the IDE companion disk attached by `testing.lisp`), then validates that the word at offset 510 of the 512-byte buffer equals `0xAA55`.
+- `demo-memmap.bwo` runs `memory-map-probe` (INT 15h E820) in the kernel's real-mode entry routine, before `enter-protected-mode`, then renders the entry count and first region in protected mode. Asserts that QEMU's BIOS returned at least one entry.

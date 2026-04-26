@@ -3,7 +3,7 @@
 (defstruct (compile-environment
             (:constructor make-compile-environment
                 (&key target section layouts state helpers constants keyboards
-                      block-devices)))
+                      block-devices memory-maps)))
   target
   section
   layouts
@@ -11,7 +11,8 @@
   helpers
   constants
   keyboards
-  block-devices)
+  block-devices
+  memory-maps)
 
 (defun helper-needed-p (environment helper)
   (gethash helper (compile-environment-helpers environment)))
@@ -1783,6 +1784,93 @@
          (dev (lookup-block-device environment dev-name)))
     (emit-ata-pio-transfer environment dev (rest args) nil)))
 
+(defstruct (memory-map-descriptor
+            (:constructor make-memory-map-descriptor
+                (&key name source max-entries entries-label)))
+  name source max-entries entries-label)
+
+(defun parse-memory-map-form (environment form)
+  (let* ((name (or (second form) (error "MEMORY-MAP requires a name.")))
+         (options (resolve-operands environment (third form)))
+         (source (or (getf options :source) :bios-e820))
+         (max-entries (or (getf options :max-entries) 32)))
+    (unless (eq source :bios-e820)
+      (error "MEMORY-MAP currently only supports :BIOS-E820, got ~S." source))
+    (unless (and (integerp max-entries) (>= max-entries 1) (<= max-entries 256))
+      (error "MEMORY-MAP :MAX-ENTRIES must be 1..256, got ~S." max-entries))
+    (make-memory-map-descriptor
+     :name name
+     :source source
+     :max-entries max-entries
+     :entries-label (intern (concatenate 'string (symbol-name name) "-ENTRIES")
+                            (or (symbol-package name) *package*)))))
+
+(defun register-memory-map (environment form)
+  (let* ((mm (parse-memory-map-form environment form))
+         (name (memory-map-descriptor-name mm)))
+    (when (gethash name (compile-environment-memory-maps environment))
+      (error "MEMORY-MAP ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-memory-maps environment)) mm)
+    mm))
+
+(defun lookup-memory-map (environment name)
+  (or (gethash name (compile-environment-memory-maps environment))
+      (error "Unknown memory map ~S — is (memory-map ~S ...) declared in this section?"
+             name name)))
+
+(defun emit-memory-map (environment form)
+  (let* ((state (compile-environment-state environment))
+         (name (second form))
+         (mm (lookup-memory-map environment name)))
+    (emit-align state 4)
+    (emit-label state name)
+    (emit-dd state '(0))                ; count dword (zeroed at boot)
+    (emit-label state (memory-map-descriptor-entries-label mm))
+    (loop repeat (* 24 (memory-map-descriptor-max-entries mm))
+          do (emit-u8 state 0))))
+
+(defun emit-memory-map-probe (environment args)
+  (require-bits environment 16 "MEMORY-MAP-PROBE")
+  (let* ((mm-name (or (first args)
+                      (error "MEMORY-MAP-PROBE requires a memory-map name.")))
+         (mm (lookup-memory-map environment mm-name))
+         (state (compile-environment-state environment))
+         (entries (memory-map-descriptor-entries-label mm))
+         (count-label mm-name)
+         (loop-label (gensym "E820-LOOP-"))
+         (done-label (gensym "E820-DONE-")))
+    (encode-instruction state 'xor '(ebx ebx))
+    (encode-instruction state 'mov (list 'edi entries))
+    (encode-instruction state 'xor '(ebp ebp))
+    (emit-label state loop-label)
+    (encode-instruction state 'mov (list 'eax #x0000E820))
+    (encode-instruction state 'mov (list 'edx #x534D4150))
+    (encode-instruction state 'mov '(ecx 24))
+    (encode-instruction state 'int '(#x15))
+    (encode-instruction state 'jc (list done-label))
+    (encode-instruction state 'cmp (list 'eax #x534D4150))
+    (encode-instruction state 'jne (list done-label))
+    (encode-instruction state 'add '(edi 24))
+    (encode-instruction state 'inc '(ebp))
+    (encode-instruction state 'test '(ebx ebx))
+    (encode-instruction state 'jnz (list loop-label))
+    (emit-label state done-label)
+    (encode-instruction state 'mov (list (list :MEM :DWORD count-label) 'ebp))))
+
+(defun emit-memory-map-base (environment args)
+  (let* ((dest (or (first args) (error "MEMORY-MAP-BASE requires a destination register.")))
+         (mm-name (or (second args) (error "MEMORY-MAP-BASE requires a memory-map name.")))
+         (mm (lookup-memory-map environment mm-name))
+         (state (compile-environment-state environment)))
+    (encode-instruction state 'mov (list dest (memory-map-descriptor-entries-label mm)))))
+
+(defun emit-memory-map-count (environment args)
+  (let* ((dest (or (first args) (error "MEMORY-MAP-COUNT requires a destination register.")))
+         (mm-name (or (second args) (error "MEMORY-MAP-COUNT requires a memory-map name.")))
+         (mm (lookup-memory-map environment mm-name))
+         (state (compile-environment-state environment)))
+    (encode-instruction state 'mov (list dest (list :MEM :DWORD (memory-map-descriptor-name mm))))))
+
 (defun pre-scan-section (environment body)
   (dolist (form body)
     (when (consp form)
@@ -1790,7 +1878,9 @@
         (:keyboard-driver
          (register-keyboard-driver environment form))
         (:block-device
-         (register-block-device environment form))))))
+         (register-block-device environment form))
+        (:memory-map
+         (register-memory-map environment form))))))
 
 (defun emit-keyboard-read (environment args)
   (require-bits environment 32 "KEYBOARD-READ")
@@ -2126,6 +2216,14 @@
        (emit-block-read environment (rest form)))
       (:block-write
        (emit-block-write environment (rest form)))
+      (:memory-map
+       (emit-memory-map environment form))
+      (:memory-map-probe
+       (emit-memory-map-probe environment (rest form)))
+      (:memory-map-base
+       (emit-memory-map-base environment (rest form)))
+      (:memory-map-count
+       (emit-memory-map-count environment (rest form)))
       (:load-section
        (destructuring-bind (_ section-name &rest args) form
          (declare (ignore _))
@@ -2152,7 +2250,8 @@
         :helpers (make-hash-table :test 'eq)
         :constants (make-hash-table :test 'eq)
         :keyboards (make-hash-table :test 'eq)
-        :block-devices (make-hash-table :test 'eq))))
+        :block-devices (make-hash-table :test 'eq)
+        :memory-maps (make-hash-table :test 'eq))))
     (pre-scan-section environment (section-spec-body section))
     (dolist (form (section-spec-body section))
       (compile-form environment form))

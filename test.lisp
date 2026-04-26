@@ -55,4 +55,9 @@
                  :expect-debugcon '("stage1: loading ata demo"
                                     "kernel: ata demo reached"
                                     "kernel: ata read ok (sig=0xAA55)"))
+    (test-source "examples/devices/demo-memmap.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading memmap demo"
+                                    "kernel: memmap demo reached"
+                                    "kernel: e820 ok"))
     (format t "Bootwright QEMU tests passed.~%")))
