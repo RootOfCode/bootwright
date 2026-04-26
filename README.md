@@ -36,14 +36,17 @@ The included [pc-bios.bwm](machines/pc-bios.bwm) machine file describes the curr
 
 The included examples are:
 
-- [demo-real.bwo](examples/demo-real.bwo) — real-mode kernel with BIOS text output.
-- [demo-protected.bwo](examples/demo-protected.bwo) — protected-mode entry, paging, IDT, and a software interrupt handler.
-- [demo-assets.bwo](examples/demo-assets.bwo) — embedding a binary asset relative to the source file.
-- [demo-timer.bwo](examples/demo-timer.bwo) — PIT-driven IRQ0 with a live `MM:SS` clock on screen.
-- [demo-probe.bwo](examples/demo-probe.bwo) — system probe that samples CR0 in hex, mirrors a structured boot log to COM1, and runs an uptime counter.
-- [demo-cpuinfo.bwo](examples/demo-cpuinfo.bwo) — issues `CPUID(0)` and `CPUID(1)` and renders the live vendor string, signature, and feature flags on screen.
-- [demo-bench.bwo](examples/demo-bench.bwo) — boot-time microbench: times an iterative Fibonacci F(20) loop with `rdtsc`, prints the cycle count in decimal, and uses `include` to pull its GDT body from [lib/gdt-flat.bwo](examples/lib/gdt-flat.bwo).
-- [demo-memops.bwo](examples/demo-memops.bwo) — exercises `(:mem ...)`, `lea`, `movzx`, `movsx`, `rep movsd`, `rep stosd`, and the generic timer helpers in one protected-mode image.
+- [demo-real.bwo](examples/basics/demo-real.bwo) — real-mode kernel with BIOS text output.
+- [demo-protected.bwo](examples/protected/demo-protected.bwo) — protected-mode entry, paging, IDT, and a software interrupt handler.
+- [demo-assets.bwo](examples/basics/demo-assets.bwo) — embedding a binary asset relative to the source file.
+- [demo-timer.bwo](examples/devices/demo-timer.bwo) — PIT-driven IRQ0 with a live `MM:SS` clock on screen.
+- [demo-probe.bwo](examples/devices/demo-probe.bwo) — system probe that samples CR0 in hex, mirrors a structured boot log to COM1, and runs an uptime counter.
+- [demo-cpuinfo.bwo](examples/cpu/demo-cpuinfo.bwo) — issues `CPUID(0)` and `CPUID(1)` and renders the live vendor string, signature, and feature flags on screen.
+- [demo-bench.bwo](examples/cpu/demo-bench.bwo) — boot-time microbench: times an iterative Fibonacci F(20) loop with `rdtsc`, prints the cycle count in decimal, and uses `include` to pull its GDT body from [lib/gdt-flat.bwo](examples/cpu/lib/gdt-flat.bwo).
+- [demo-memops.bwo](examples/cpu/demo-memops.bwo) — exercises `(:mem ...)`, `lea`, `movzx`, `movsx`, `rep movsd`, `rep stosd`, and the generic timer helpers in one protected-mode image.
+- [demo-sysinstr.bwo](examples/cpu/demo-sysinstr.bwo) — exercises CPL=0 system instructions: `RDMSR(IA32_TSC)`, an atomic `LOCK ADD` on a counter, `INVLPG` via `tlb-flush-page`, `MOV CR3,CR3` via `tlb-flush-all`, and `MFENCE` via `memory-barrier`.
+- [demo-keyboard.bwo](examples/devices/demo-keyboard.bwo) — interactive PS/2 keyboard echo: declares a `keyboard-driver`, wires IRQ1, blocks on `keyboard-read`, then mirrors each pressed key to a VGA cell and to debugcon. Run in a QEMU window and type.
+- [demo-ata.bwo](examples/devices/demo-ata.bwo) — declares a primary-bus ATA-PIO LBA28 `block-device`, reads sector 0 of the IDE companion disk, and verifies the `0xAA55` boot signature.
 
 ## DSL Features
 
@@ -71,6 +74,9 @@ Bootwright currently supports:
 - Interrupt-controller helpers like `pic-remap`, `pic-mask-all`, `pic-mask`, `pic-unmask`, and `pic-eoi`.
 - PIT programming via `pit-set-frequency`.
 - Generic machine-backed IRQ and timer helpers via `irq-remap`, `irq-mask`, `irq-unmask`, `irq-end-of-interrupt`, `timer-set-frequency`, `timer-enable`, `timer-disable`, and `timer-read-counter`.
+- ISA-generic memory and TLB primitives via `memory-barrier` (`:load`/`:store`/full), `tlb-flush-page`, `tlb-flush-all`, and `load-tr` (Phase 4 starter set).
+- PS/2 keyboard support via `keyboard-driver` (declares ring buffer + scancode table + IRQ1 handler), `keyboard-read` (blocking), and `keyboard-poll` (non-blocking with `:empty` jump target). US-QWERTY scancode set 1; user wires the handler in their own IDT.
+- ATA-PIO LBA28 disk support via `block-device` (primary/secondary bus, 512-byte sectors), `block-read` (sector → buffer), and `block-write` (buffer → sector + cache flush). The bundled testing harness attaches every image as both floppy (boot) and IDE master (data), so `block-read` against the image's own sector 0 round-trips the boot signature.
 - Bootwright-native source loading/building through `load-os-source` and `build-os-source-file`.
 - Headless QEMU verification via `test-os` and `test-os-source-file`.
 - Multi-file source composition via `(include "other.bwo" ...)` — includes are resolved relative to the calling file and run in the same package, so a library file can define Lisp helpers that the main file splices into a `defos` body with `#.` (read-time eval).
@@ -85,6 +91,8 @@ The assembler supports:
 - Arithmetic (`add`, `sub`, `mul`, `div`, `not`, `neg`), bitwise (`xor`, `or`, `and`, `test`), shifts (`shl`, `shr`), and the unsigned/signed conditional-jump family (`je`/`jne`/`jb`/`jae`/`jbe`/`ja`/`jl`/`jge`/`jle`/`jg`/`js`/`jns` plus the `jz`/`jnz`/`jc`/`jnc` aliases).
 - `loop`, `pusha`/`popa`, `pushfd`/`popfd` for tighter handler/loop bodies.
 - `cpuid` for CPU identification and `rdtsc` for cycle counting.
+- CPL=0 system ops: `wrmsr`/`rdmsr`, `clts`, `ltr`, `invlpg`, `lret`/`retf`, `cmpxchg`, the `lock` prefix wrapper, and the `mfence`/`lfence`/`sfence` memory fences.
+- String I/O ops: `insb`/`insw`/`insd` and `outsb`/`outsw`/`outsd` (16/32-bit operand size selected by mode + prefix).
 
 Memory operands follow Lisp syntax and can optionally declare width when needed:
 
@@ -114,11 +122,14 @@ That writes:
 - `out/bootwright-cpuinfo.img`
 - `out/bootwright-bench.img`
 - `out/bootwright-memops.img`
+- `out/bootwright-sysinstr.img`
+- `out/bootwright-keyboard.img`
+- `out/bootwright-ata.img`
 
 You can also build a `.bwo` file directly from Lisp:
 
 ```lisp
-(bootwright:build-os-source-file #P"examples/demo-protected.bwo")
+(bootwright:build-os-source-file #P"examples/protected/demo-protected.bwo")
 ```
 
 ## Test
@@ -127,7 +138,7 @@ Bootwright can also build and boot an image under headless QEMU, then assert on 
 
 ```lisp
 (bootwright:test-os-source-file
- #P"examples/demo-protected.bwo"
+ #P"examples/protected/demo-protected.bwo"
  :timeout-ms 5000
  :expect-debugcon '("stage1: loading protected-mode demo"
                     "kernel: protected mode + paging active"
@@ -161,10 +172,13 @@ qemu-system-i386 \
 
 ## Example Notes
 
-- `demo-assets.bwo` shows `include-binary` loading [kernel-banner.txt](/examples/assets/kernel-banner.txt) relative to the source file.
+- `demo-assets.bwo` shows `include-binary` loading [kernel-banner.txt](examples/basics/assets/kernel-banner.txt) relative to the source file.
 - `demo-protected.bwo` uses the machine-backed `framebuffer-*` and `irq-remap` forms for its protected-mode status panel.
 - `demo-timer.bwo` uses the generic `timer-set-frequency`, `irq-unmask`, and `irq-end-of-interrupt` forms and keeps a live `MM:SS` timer updated on the VGA screen from IRQ0.
 - `demo-probe.bwo` reads the live `CR0` value via `mov eax, cr0`, prints it with `vga-print-hex`, mirrors a labelled boot log over COM1 via `uart-init`/`uart-print` (run with `-serial stdio` to capture), beeps once via `pc-speaker-tone`, and parks the VGA hardware cursor in the corner.
 - `demo-cpuinfo.bwo` runs `cpuid` twice and uses `vga-print-ascii4` to render the 12-byte vendor string (e.g. `GenuineIntel`) plus the signature and feature dwords as hex; the values reflect the underlying CPU and respond to QEMU's `-cpu` option.
 - `demo-bench.bwo` brackets a 20-iteration Fibonacci loop with `rdtsc`, prints the resulting cycle delta in 10-digit zero-padded decimal via `vga-print-decimal`, and pulls its GDT body from `lib/gdt-flat.bwo` via `(include "lib/gdt-flat.bwo")` plus `#.(flat-gdt 'gdt :pointer 'gdt-descriptor)`.
 - `demo-memops.bwo` validates runtime dword stores/loads, `REP MOVSD`, `REP STOSD`, `MOVZX`, `MOVSX`, and a PIT counter latch/read, then reports success over QEMU debugcon.
+- `demo-sysinstr.bwo` issues `RDMSR(0x10)`, builds an atomic counter with `LOCK ADD` followed by `MEMORY-BARRIER`, then runs `TLB-FLUSH-PAGE`/`TLB-FLUSH-ALL` to exercise the Phase 4 memory and TLB primitives.
+- `demo-keyboard.bwo` is interactive: it remaps the PIC to unmask IRQ1 only, hands off to a `keyboard-driver`-emitted scancode handler, and runs `keyboard-read` in a tight loop that echoes each typed character to row 2 column 22 and to debugcon. Verified under QEMU by sending `sendkey a b c ret` through the monitor pipe.
+- `demo-ata.bwo` issues a one-sector ATA-PIO read of LBA 0 (boot sector of the IDE companion disk attached by `testing.lisp`), then validates that the word at offset 510 of the 512-byte buffer equals `0xAA55`.

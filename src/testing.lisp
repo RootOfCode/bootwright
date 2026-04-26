@@ -50,8 +50,9 @@
                                     collect ch
                                   else
                                     collect #\-)
-                           'string)))
-    (string-trim "-" sanitized)))
+                           'string))
+         (trimmed (string-trim "-" sanitized)))
+    (if (zerop (length trimmed)) nil trimmed)))
 
 (defun make-test-artifact-pathname (designator type)
   (let* ((tag (or (sanitize-test-token designator) "bootwright"))
@@ -89,19 +90,40 @@
     ((:x86-16 :x86-32) "qemu-system-i386")
     (:x86-64 "qemu-system-x86_64")))
 
+(defun copy-image-bytes (source destination)
+  (with-open-file (in source :direction :input :element-type '(unsigned-byte 8))
+    (with-open-file (out destination
+                         :direction :output
+                         :element-type '(unsigned-byte 8)
+                         :if-exists :supersede
+                         :if-does-not-exist :create)
+      (let ((buffer (make-array 4096 :element-type '(unsigned-byte 8))))
+        (loop for read = (read-sequence buffer in)
+              while (plusp read)
+              do (write-sequence buffer out :end read)))))
+  destination)
+
+(defun ide-companion-path (image-path)
+  (pathname (concatenate 'string (namestring image-path) ".ide")))
+
 (defun qemu-arguments-for-image (machine image-path debugcon-path serial-path)
   (typecase (machine-descriptor-boot-protocol machine)
     (bios-mbr-protocol
-     (list "-display" "none"
-           "-monitor" "none"
-           "-parallel" "none"
-           "-no-reboot"
-           "-no-shutdown"
-           "-serial" (format nil "file:~A" (namestring serial-path))
-           "-global" "isa-debugcon.iobase=0xe9"
-           "-debugcon" (format nil "file:~A" (namestring debugcon-path))
-           "-drive" (format nil "format=raw,file=~A,if=floppy"
-                            (namestring image-path))))
+     (let ((ide-path (ide-companion-path image-path)))
+       (copy-image-bytes image-path ide-path)
+       (list "-display" "none"
+             "-monitor" "none"
+             "-parallel" "none"
+             "-no-reboot"
+             "-no-shutdown"
+             "-boot" "order=a"
+             "-serial" (format nil "file:~A" (namestring serial-path))
+             "-global" "isa-debugcon.iobase=0xe9"
+             "-debugcon" (format nil "file:~A" (namestring debugcon-path))
+             "-drive" (format nil "format=raw,file=~A,if=floppy"
+                              (namestring image-path))
+             "-drive" (format nil "format=raw,file=~A,if=ide,index=0,media=disk"
+                              (namestring ide-path)))))
     (t
      (error "Bootwright QEMU testing does not support boot protocol ~S yet."
             (machine-descriptor-boot-protocol machine)))))

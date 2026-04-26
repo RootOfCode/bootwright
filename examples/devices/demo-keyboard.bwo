@@ -1,0 +1,88 @@
+;;;; Bootwright keyboard echo demo (interactive).
+;;;;
+;;;; Wires IRQ1 to a PS/2 set-1 scancode handler, runs a tight read loop
+;;;; that echoes each pressed key to a fixed VGA cell, mirrors the byte
+;;;; to debugcon, and increments a key counter.  Boot in QEMU with a
+;;;; visible window and start typing:
+;;;;
+;;;;   qemu-system-i386 -drive format=raw,file=out/bootwright-keyboard.img,if=floppy
+;;;;
+;;;; The demo runs forever; close QEMU when finished.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *keyboard-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading keyboard demo
+")
+      (bios-print "Bootwright stage 1: loading keyboard demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    ;; Section-relative offset of (row=2, col=22) on the VGA text plane
+    ;; (#xB8000 - #x10000 + (2*80+22)*2).
+    (const echo-cell #xA8174)
+    (string banner-pmode "Stage 1 ok. Entering protected mode...")
+    (string label-prompt "Last key       :")
+    (string label-count  "Keys received  :")
+    (string label-help-1 "Type any key - chars echo to the right and to debugcon.")
+    (string label-help-2 "PS/2 set-1, US-QWERTY, IRQ1 ring buffer (size 64).")
+    (string debug-ready  "kernel: keyboard demo reached
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry keyboard-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine keyboard-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      ;; Remap PIC and unmask only IRQ1 (keyboard).
+      (irq-remap :master-mask #xFD :slave-mask #xFF)
+      (load-idt idt-descriptor)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 9
+                                :attribute #x1E
+                                :title "Bootwright keyboard demo")
+      (framebuffer-print-at screen0 label-prompt :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-count  :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help-1 :row 5 :column 2 :attribute #x2E)
+      (framebuffer-print-at screen0 label-help-2 :row 6 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+      (mov ebp 0)               ; ebp = key counter (preserved by helpers)
+      (sti)
+      (label echo-loop)
+      (keyboard-read kbd al)    ; al = ASCII byte; ebx/ecx clobbered
+      (mov edi echo-cell)
+      (mov ah #x4F)
+      (stosw)                   ; render the typed character on screen
+      (out #xE9 al)             ; mirror byte to debugcon
+      (inc ebp)
+      (vga-print-decimal ebp :row 3 :column 22 :attribute #x4F)
+      (jmp echo-loop))
+    (routine default-interrupt
+      (push eax)
+      (debug-print "kernel: unexpected interrupt
+")
+      (pop eax)
+      (hang))
+    (idt idt (:pointer idt-descriptor :selector #x08 :default default-interrupt)
+      (:entry #x21 kbd-handler))
+    (keyboard-driver kbd (:controller :ps2
+                          :irq 1
+                          :scancode-map :us-qwerty
+                          :buffer-size 64))))

@@ -6,13 +6,12 @@
 (defvar *os-source-registry* (make-hash-table :test 'equal))
 
 (defun normalize-os-source-pathname (designator)
-  (let* ((pathname (pathname designator))
-         (defaults (or *default-pathname-defaults* *bootwright-root*)))
+  (let ((pathname (pathname designator)))
     (merge-pathnames
      (if (pathname-type pathname)
          pathname
          (make-pathname :type *bootwright-source-type* :defaults pathname))
-     defaults)))
+     *default-pathname-defaults*)))
 
 (defun os-source-key (pathname)
   (namestring (merge-pathnames pathname)))

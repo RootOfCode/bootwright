@@ -1,0 +1,89 @@
+;;;; Bootwright ATA-PIO read demo.
+;;;;
+;;;; Declares a primary-bus ATA-PIO LBA28 block device, reads sector 0 of
+;;;; the same disk into a 512-byte buffer, then verifies the boot
+;;;; signature (word at offset 510 = 0xAA55).  Because the build pipeline
+;;;; pads the boot sector with the signature, reading sector 0 of the
+;;;; mounted disk must echo our own MBR back.  Run under QEMU with the
+;;;; image attached on both floppy (boot) and IDE master (data) — the
+;;;; bundled testing.lisp does this automatically.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *ata-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading ata demo
+")
+      (bios-print "Bootwright stage 1: loading ATA demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode  "Stage 1 ok. Entering protected mode...")
+    (string label-lba     "LBA            :")
+    (string label-sig     "Boot signature :")
+    (string label-status  "Status         :")
+    (string label-help    "ATA-PIO LBA28 read of sector 0 (boot signature 0xAA55).")
+    (string status-ok     "PASS")
+    (string status-fail   "FAIL")
+    (string debug-ready   "kernel: ata demo reached
+")
+    (string debug-pass    "kernel: ata read ok (sig=0xAA55)
+")
+    (string debug-fail    "kernel: ata read failed (signature mismatch)
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry ata-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine ata-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 9
+                                :attribute #x1E
+                                :title "Bootwright ATA-PIO demo")
+      (framebuffer-print-at screen0 label-lba    :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-sig    :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-status :row 4 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help   :row 7 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+      ;; Render the LBA we are about to read.
+      (vga-print-decimal 0 :row 2 :column 22 :attribute #x4F)
+      ;; Read sector 0 into ata-buffer.
+      (block-read hdd0 :lba 0 :count 1 :buffer ata-buffer)
+      ;; Load the boot signature word at offset 510, compare BEFORE the
+      ;; render (vga-print-hex clobbers EAX through its helper).
+      (mov ebx ata-buffer)
+      (movzx eax (:mem :word ebx 510))
+      (cmp eax #xAA55)
+      (jne-near ata-fail)
+      (vga-print-hex eax :row 3 :column 22 :attribute #x4F)
+      (framebuffer-print-at screen0 status-ok :row 4 :column 22 :attribute #x2F)
+      (debug-print debug-pass)
+      (idle-forever)
+      (label ata-fail)
+      (framebuffer-print-at screen0 status-fail :row 4 :column 22 :attribute #x4F)
+      (debug-print debug-fail)
+      (hang))
+    (block-device hdd0 (:type :ata-pio
+                        :bus :primary
+                        :addressing :lba28
+                        :sector-size 512))
+    (align 4)
+    (label ata-buffer)
+    (fill 512 0)))

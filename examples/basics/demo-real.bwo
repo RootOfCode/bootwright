@@ -1,0 +1,35 @@
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *demo-os* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading real-mode demo
+")
+      (bios-print "Bootwright stage 1: loading real-mode kernel...")
+      (load-section kernel :on-error disk-error)
+      (bios-print "Stage 1 complete. Jumping to kernel...")
+      (jump-section kernel))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel (:load-segment #x1000 :entry kernel-main)
+    (const kernel-stack #x9000)
+    (string kernel-title "Bootwright real-mode demo")
+    (string kernel-banner "Hello from the Bootwright kernel.")
+    (string kernel-tail "This image is defined in a .bwo source file.")
+    (string kernel-foot "Layout now uses BIOS cursor placement.")
+    (routine kernel-main
+      (initialize-real-mode :stack kernel-stack)
+      (set-video-mode 3)
+      (debug-print "kernel: real-mode demo reached
+")
+      (bios-print-at kernel-title :row 1 :column 2)
+      (bios-print-at kernel-banner :row 3 :column 2)
+      (bios-print-at kernel-tail :row 4 :column 2)
+      (bios-print-at kernel-foot :row 6 :column 2)
+      (hang))))

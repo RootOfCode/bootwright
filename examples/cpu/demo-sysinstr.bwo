@@ -1,0 +1,96 @@
+;;;; Bootwright system-instruction demo.
+;;;;
+;;;; Exercises the CPL=0 system instructions added in Phase 0/4 of the
+;;;; roadmap: RDMSR(IA32_TSC), an atomic LOCK ADD on a counter, INVLPG
+;;;; via TLB-FLUSH-PAGE, MOV CR3,CR3 via TLB-FLUSH-ALL, and MFENCE via
+;;;; MEMORY-BARRIER.  Runs in flat 32-bit protected mode without paging,
+;;;; so INVLPG and the CR3 round-trip are no-ops on real silicon but are
+;;;; still legal CPL=0 instructions and execute on QEMU TCG.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *sysinstr-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading sysinstr demo
+")
+      (bios-print "Bootwright stage 1: loading sysinstr demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode  "Stage 1 ok. Entering protected mode...")
+    (string label-tsc      "RDMSR TSC      :")
+    (string label-counter  "LOCK ADD       :")
+    (string label-cr3-pre  "CR3 register   :")
+    (string label-cr3-post "After flush    :")
+    (string label-help     "RDMSR + LOCK ADD + INVLPG + MEMORY-BARRIER.")
+    (string debug-ready    "kernel: sysinstr demo reached
+")
+    (string debug-pass     "kernel: sysinstr demo complete
+")
+    (string debug-fail     "kernel: sysinstr counter mismatch
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry sysinstr-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine sysinstr-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 11
+                                :attribute #x1E
+                                :title "Bootwright sysinstr demo")
+      (framebuffer-print-at screen0 label-tsc      :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-counter  :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-cr3-pre  :row 4 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-cr3-post :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help     :row 9 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+
+      ;; --- RDMSR(IA32_TIME_STAMP_COUNTER = 0x10) ---
+      (mov ecx #x10)
+      (rdmsr)
+      (vga-print-hex eax :row 2 :column 22 :attribute #x4F)
+
+      ;; --- LOCK ADD: atomic counter from 0 to 7 ---
+      (mov (:mem :dword counter) 0)
+      (lock add (:mem :dword counter) 1)
+      (lock add (:mem :dword counter) 2)
+      (lock add (:mem :dword counter) 4)
+      (memory-barrier)
+      (mov eax (:mem :dword counter))
+      (cmp eax 7)
+      (jne-near sysinstr-fail)
+      (vga-print-hex eax :row 3 :column 22 :attribute #x2F)
+
+      ;; --- TLB ops: INVLPG one page, then MOV CR3,CR3 global flush ---
+      (mov eax cr3)
+      (vga-print-hex eax :row 4 :column 22 :attribute #x4F)
+      (tlb-flush-page #x100000)
+      (tlb-flush-all)
+      (mov eax cr3)
+      (vga-print-hex eax :row 5 :column 22 :attribute #x4F)
+
+      (debug-print debug-pass)
+      (idle-forever)
+
+      (label sysinstr-fail)
+      (debug-print debug-fail)
+      (hang))
+    (label counter)
+    (fill 4 0)))

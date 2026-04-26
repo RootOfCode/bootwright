@@ -1,0 +1,127 @@
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *memory-ops-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading memory ops demo
+")
+      (bios-print "Bootwright stage 1: loading memory ops demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode "Stage 1 ok. Entering protected mode...")
+    (string debug-ready "kernel: memory ops demo reached
+")
+    (string debug-pass "kernel: memory ops checks passed
+")
+    (string debug-fail "kernel: memory ops check failed
+")
+    (string label-store  "Store/load dword:")
+    (string label-copy   "REP MOVSD copy :")
+    (string label-fill   "REP STOSD fill :")
+    (string label-zx     "MOVZX byte     :")
+    (string label-sx     "MOVSX byte     :")
+    (string label-timer  "PIT sample     :")
+    (string label-help   "Uses :mem, LEA, MOVZX/MOVSX, REP MOVSD/STOSD.")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry memops-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine memops-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 62 :height 11
+                                :attribute #x1E
+                                :title "Bootwright memory ops")
+      (framebuffer-print-at screen0 label-store :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-copy  :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-fill  :row 4 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-zx    :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-sx    :row 6 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-timer :row 7 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help  :row 9 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+
+      ;; Direct memory store/load through (:mem ...).
+      (mov eax #x11223344)
+      (mov (:mem :dword scratch-value) eax)
+      (mov ecx (:mem :dword scratch-value))
+      (cmp ecx #x11223344)
+      (jne-near memops-fail)
+      (vga-print-hex ecx :row 2 :column 22 :attribute #x4F)
+
+      ;; REP MOVSD using runtime pointers built by LEA.
+      (lea esi (:mem copy-source))
+      (lea edi (:mem copy-dest))
+      (mov ecx 1)
+      (rep movsd)
+      (mov edx (:mem :dword copy-dest))
+      (cmp edx #xAABBCCDD)
+      (jne-near memops-fail)
+      (vga-print-hex edx :row 3 :column 22 :attribute #x4F)
+
+      ;; REP STOSD plus a base+index*scale memory read.
+      (mov eax #xDEADBEEF)
+      (lea edi (:mem fill-buffer))
+      (mov ecx 4)
+      (rep stosd)
+      (lea ebx (:mem fill-buffer))
+      (mov ecx 3)
+      (mov esi (:mem :dword ebx ecx 4 0))
+      (cmp esi #xDEADBEEF)
+      (jne-near memops-fail)
+      (vga-print-hex esi :row 4 :column 22 :attribute #x4F)
+
+      ;; MOVZX / MOVSX from byte memory.
+      (movzx ebp (:mem :byte unsigned-byte))
+      (cmp ebp #x00000080)
+      (jne-near memops-fail)
+      (vga-print-hex ebp :row 5 :column 22 :attribute #x2F)
+
+      (movsx edi (:mem :byte signed-byte))
+      (cmp edi #xFFFFFF80)
+      (jne-near memops-fail)
+      (vga-print-hex edi :row 6 :column 22 :attribute #x2F)
+
+      ;; Generic timer helpers on the current machine descriptor.
+      (timer-disable)
+      (timer-set-frequency 100)
+      (timer-enable)
+      (timer-read-counter ax)
+      (movzx edx ax)
+      (timer-disable)
+      (vga-print-hex edx :row 7 :column 22 :attribute #x2F)
+      (debug-print debug-pass)
+      (idle-forever)
+
+      (label memops-fail)
+      (debug-print debug-fail)
+      (hang))
+    (label copy-source)
+    (dd #xAABBCCDD)
+    (label copy-dest)
+    (fill 4 0)
+    (label fill-buffer)
+    (fill 16 0)
+    (label scratch-value)
+    (fill 4 0)
+    (label unsigned-byte)
+    (db #x80)
+    (label signed-byte)
+    (db #x80)))

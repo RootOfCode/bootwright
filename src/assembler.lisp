@@ -799,8 +799,27 @@
               (emit-unary-register-op state #x40 (first operands) 32 +x86-dword-registers+))
              ((word-register-p (first operands))
               (emit-unary-register-op state #x40 (first operands) 16 +x86-word-registers+))
+             ((byte-register-p (first operands))
+              (emit-u8 state #xFE)
+              (emit-modrm state 3 0 (byte-register-p (first operands))))
+             ((memory-operand-p (first operands))
+              (let ((width (or (memory-operand-width (first operands))
+                               (error "Memory INC requires an explicit width, got ~S."
+                                      (first operands)))))
+                (ecase width
+                  (8
+                   (emit-u8 state #xFE)
+                   (emit-modrm-r/m state 0 (first operands)))
+                  (16
+                   (emit-operand-size-prefix state 16)
+                   (emit-u8 state #xFF)
+                   (emit-modrm-r/m state 0 (first operands)))
+                  (32
+                   (emit-operand-size-prefix state 32)
+                   (emit-u8 state #xFF)
+                   (emit-modrm-r/m state 0 (first operands))))))
              (t
-              (error "INC currently supports 16-bit and 32-bit registers, got ~S."
+              (error "INC requires a register or sized memory operand, got ~S."
                      (first operands)))))
       (:dec
        (expect-arity 1)
@@ -808,8 +827,27 @@
               (emit-unary-register-op state #x48 (first operands) 32 +x86-dword-registers+))
              ((word-register-p (first operands))
               (emit-unary-register-op state #x48 (first operands) 16 +x86-word-registers+))
+             ((byte-register-p (first operands))
+              (emit-u8 state #xFE)
+              (emit-modrm state 3 1 (byte-register-p (first operands))))
+             ((memory-operand-p (first operands))
+              (let ((width (or (memory-operand-width (first operands))
+                               (error "Memory DEC requires an explicit width, got ~S."
+                                      (first operands)))))
+                (ecase width
+                  (8
+                   (emit-u8 state #xFE)
+                   (emit-modrm-r/m state 1 (first operands)))
+                  (16
+                   (emit-operand-size-prefix state 16)
+                   (emit-u8 state #xFF)
+                   (emit-modrm-r/m state 1 (first operands)))
+                  (32
+                   (emit-operand-size-prefix state 32)
+                   (emit-u8 state #xFF)
+                   (emit-modrm-r/m state 1 (first operands))))))
              (t
-              (error "DEC currently supports 16-bit and 32-bit registers, got ~S."
+              (error "DEC requires a register or sized memory operand, got ~S."
                      (first operands)))))
       (:push
        (expect-arity 1)
@@ -1223,10 +1261,128 @@
        (expect-arity 0)
        (emit-operand-size-prefix state 32)
        (emit-u8 state #xA5))
+      (:insb
+       (expect-arity 0)
+       (emit-u8 state #x6C))
+      (:insw
+       (expect-arity 0)
+       (emit-operand-size-prefix state 16)
+       (emit-u8 state #x6D))
+      (:insd
+       (expect-arity 0)
+       (emit-operand-size-prefix state 32)
+       (emit-u8 state #x6D))
+      (:outsb
+       (expect-arity 0)
+       (emit-u8 state #x6E))
+      (:outsw
+       (expect-arity 0)
+       (emit-operand-size-prefix state 16)
+       (emit-u8 state #x6F))
+      (:outsd
+       (expect-arity 0)
+       (emit-operand-size-prefix state 32)
+       (emit-u8 state #x6F))
       (:rep
        (expect-arity 1)
        (emit-u8 state #xF3)
        (encode-instruction state (first operands) '()))
+      (:lock
+       (when (null operands)
+         (error "LOCK requires an instruction to wrap."))
+       (emit-u8 state #xF0)
+       (encode-instruction state (first operands) (rest operands)))
+      (:mfence
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #xAE)
+       (emit-u8 state #xF0))
+      (:lfence
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #xAE)
+       (emit-u8 state #xE8))
+      (:sfence
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #xAE)
+       (emit-u8 state #xF8))
+      (:wrmsr
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x30))
+      (:rdmsr
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x32))
+      (:clts
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x06))
+      (:invlpg
+       (expect-arity 1)
+       (let ((operand (first operands)))
+         (unless (memory-operand-p operand)
+           (error "INVLPG requires a memory operand, got ~S." operand))
+         (emit-u8 state #x0F)
+         (emit-u8 state #x01)
+         (emit-modrm-r/m state 7 operand)))
+      (:ltr
+       (expect-arity 1)
+       (let ((operand (first operands)))
+         (emit-u8 state #x0F)
+         (emit-u8 state #x00)
+         (cond ((word-register-p operand)
+                (emit-modrm state 3 3 (word-register-p operand)))
+               ((memory-operand-p operand)
+                (ensure-memory-width operand 16)
+                (emit-modrm-r/m state 3 operand))
+               (t
+                (error "LTR requires a 16-bit register or memory operand, got ~S." operand)))))
+      (:retf
+       (cond ((null operands)
+              (emit-u8 state #xCB))
+             ((= (length operands) 1)
+              (emit-u8 state #xCA)
+              (emit-imm16 state (first operands)))
+             (t
+              (error "RETF expects 0 or 1 operand, got ~D." (length operands)))))
+      (:lret
+       (cond ((null operands)
+              (emit-u8 state #xCB))
+             ((= (length operands) 1)
+              (emit-u8 state #xCA)
+              (emit-imm16 state (first operands)))
+             (t
+              (error "LRET expects 0 or 1 operand, got ~D." (length operands)))))
+      (:cmpxchg
+       (expect-arity 2)
+       (destructuring-bind (destination source) operands
+         (cond ((and (or (dword-register-p destination) (memory-operand-p destination))
+                     (dword-register-p source))
+                (when (memory-operand-p destination)
+                  (ensure-memory-width destination 32))
+                (emit-operand-size-prefix state 32)
+                (emit-u8 state #x0F)
+                (emit-u8 state #xB1)
+                (emit-modrm-r/m state (dword-register-p source) destination))
+               ((and (or (word-register-p destination) (memory-operand-p destination))
+                     (word-register-p source))
+                (when (memory-operand-p destination)
+                  (ensure-memory-width destination 16))
+                (emit-operand-size-prefix state 16)
+                (emit-u8 state #x0F)
+                (emit-u8 state #xB1)
+                (emit-modrm-r/m state (word-register-p source) destination))
+               ((and (or (byte-register-p destination) (memory-operand-p destination))
+                     (byte-register-p source))
+                (when (memory-operand-p destination)
+                  (ensure-memory-width destination 8))
+                (emit-u8 state #x0F)
+                (emit-u8 state #xB0)
+                (emit-modrm-r/m state (byte-register-p source) destination))
+               (t
+                (error "Unsupported CMPXCHG operands ~S." operands)))))
       (:cpuid
        (expect-arity 0)
        (emit-u8 state #x0F)

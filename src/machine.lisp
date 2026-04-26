@@ -5,8 +5,7 @@
 (defvar *loaded-machines* nil)
 (defvar *machine-registry* (make-hash-table :test 'equal))
 
-(defun normalize-machine-pathname (designator &optional (defaults (or *default-pathname-defaults*
-                                                                      *bootwright-root*)))
+(defun normalize-machine-pathname (designator &optional (defaults *default-pathname-defaults*))
   (let ((pathname (pathname designator)))
     (merge-pathnames
      (if (pathname-type pathname)

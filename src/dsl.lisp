@@ -2,13 +2,16 @@
 
 (defstruct (compile-environment
             (:constructor make-compile-environment
-                (&key target section layouts state helpers constants)))
+                (&key target section layouts state helpers constants keyboards
+                      block-devices)))
   target
   section
   layouts
   state
   helpers
-  constants)
+  constants
+  keyboards
+  block-devices)
 
 (defun helper-needed-p (environment helper)
   (gethash helper (compile-environment-helpers environment)))
@@ -955,6 +958,57 @@
                                       (error "LOAD-IDT requires the IDT descriptor label.")))))
     (encode-instruction (compile-environment-state environment) 'lidt (list pointer))))
 
+(defun emit-memory-barrier (environment args)
+  (let* ((kind (and args (resolve-operand environment (first args))))
+         (state (compile-environment-state environment))
+         (selector (cond ((null kind) :full)
+                         ((symbolp kind) (token-keyword kind))
+                         (t kind))))
+    (require-bits environment 32 "MEMORY-BARRIER")
+    (case selector
+      (:full  (encode-instruction state 'mfence '()))
+      (:load  (encode-instruction state 'lfence '()))
+      (:store (encode-instruction state 'sfence '()))
+      (t
+       (error "MEMORY-BARRIER expects :LOAD, :STORE, or no argument, got ~S." kind)))))
+
+(defun emit-tlb-flush-page (environment args)
+  (require-bits environment 32 "TLB-FLUSH-PAGE")
+  (let* ((address (resolve-operand environment
+                                   (or (first args)
+                                       (error "TLB-FLUSH-PAGE requires a linear address."))))
+         (state (compile-environment-state environment))
+         (memory-operand (cond ((memory-operand-p address) address)
+                               ((or (integerp address) (symbolp address))
+                                (list :MEM address))
+                               (t
+                                (error "TLB-FLUSH-PAGE expects an integer, label, or memory operand, got ~S."
+                                       address)))))
+    (encode-instruction state 'invlpg (list memory-operand))))
+
+(defun emit-tlb-flush-all (environment)
+  (require-bits environment 32 "TLB-FLUSH-ALL")
+  (let ((state (compile-environment-state environment)))
+    (encode-instruction state 'mov '(eax cr3))
+    (encode-instruction state 'mov '(cr3 eax))))
+
+(defun emit-load-tr (environment args)
+  (require-bits environment 32 "LOAD-TR")
+  (let* ((selector (resolve-operand environment
+                                    (or (first args)
+                                        (error "LOAD-TR requires a TSS selector."))))
+         (state (compile-environment-state environment)))
+    (cond ((integerp selector)
+           (unless (typep selector '(integer 0 #xFFFF))
+             (error "LOAD-TR selector must fit in 16 bits, got ~S." selector))
+           (encode-instruction state 'mov (list 'ax selector))
+           (encode-instruction state 'ltr '(ax)))
+          ((or (word-register-p selector) (memory-operand-p selector))
+           (encode-instruction state 'ltr (list selector)))
+          (t
+           (error "LOAD-TR expects an integer selector, 16-bit register, or memory operand, got ~S."
+                  selector)))))
+
 (defun ensure-pic8259-controller (controller)
   (unless (typep controller 'pic8259-controller)
     (error "The current machine uses an unsupported interrupt controller ~S." controller))
@@ -1154,31 +1208,31 @@
          (destination (or (first args)
                           (error "TIMER-READ-COUNTER requires a destination register.")))
          (device (machine-timer-device-or-die environment))
-         (channel (getf (rest args) :channel 0))
-         (channel-port (ecase channel
-                         (0 (pit8253-timer-channel0-port device))
-                         (1 (pit8253-timer-channel1-port device))
-                         (2 (pit8253-timer-channel2-port device))))
-         (latch-command (ash channel 6)))
+         (channel (getf (rest args) :channel 0)))
     (unless (typep channel '(integer 0 2))
       (error "PIT channel must be 0, 1, or 2, got ~S." channel))
     (unless (or (word-register-p destination)
                 (dword-register-p destination))
       (error "TIMER-READ-COUNTER requires a 16-bit or 32-bit destination register, got ~S."
              destination))
-    (encode-instruction state 'mov (list 'al latch-command))
-    (encode-instruction state 'out (list (pit8253-timer-control-port device) 'al))
-    (encode-instruction state 'mov (list 'dx channel-port))
-    (encode-instruction state 'in '(al dx))
-    (encode-instruction state 'mov '(ah al))
-    (encode-instruction state 'in '(al dx))
-    (encode-instruction state 'xchg '(al ah))
-    (cond ((eql (token-keyword destination) :AX)
-           nil)
-          ((word-register-p destination)
-           (encode-instruction state 'mov (list destination 'ax)))
-          (t
-           (encode-instruction state 'movzx (list destination 'ax))))))
+    (let ((channel-port (ecase channel
+                          (0 (pit8253-timer-channel0-port device))
+                          (1 (pit8253-timer-channel1-port device))
+                          (2 (pit8253-timer-channel2-port device))))
+          (latch-command (ash channel 6)))
+      (encode-instruction state 'mov (list 'al latch-command))
+      (encode-instruction state 'out (list (pit8253-timer-control-port device) 'al))
+      (encode-instruction state 'mov (list 'dx channel-port))
+      (encode-instruction state 'in '(al dx))
+      (encode-instruction state 'mov '(ah al))
+      (encode-instruction state 'in '(al dx))
+      (encode-instruction state 'xchg '(al ah))
+      (cond ((eql (token-keyword destination) :AX)
+             nil)
+            ((word-register-p destination)
+             (encode-instruction state 'mov (list destination 'ax)))
+            (t
+             (encode-instruction state 'movzx (list destination 'ax)))))))
 
 (defun emit-timer-read-counter (environment args)
   (typecase (machine-timer-device-or-die environment)
@@ -1459,6 +1513,340 @@
     (encode-instruction state 'and '(al #xFC))
     (encode-instruction state 'out '(#x61 al))))
 
+(defstruct (keyboard-descriptor
+            (:constructor make-keyboard-descriptor
+                (&key name controller irq buffer-size scancode-map
+                      handler-label table-label buffer-label head-label tail-label)))
+  name controller irq buffer-size scancode-map
+  handler-label table-label buffer-label head-label tail-label)
+
+(defparameter +keyboard-us-qwerty-table+
+  ;; 128-byte set-1 scancode -> ASCII (0 = unmapped / modifier / release-class).
+  (let ((table (make-array 128 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref table #x01) #x1B)                          ; ESC
+    (loop for i from #x02 to #x0A
+          do (setf (aref table i) (+ #x30 (- i 1))))       ; '1'..'9'
+    (setf (aref table #x0B) #x30                           ; '0'
+          (aref table #x0C) #x2D                           ; '-'
+          (aref table #x0D) #x3D                           ; '='
+          (aref table #x0E) #x08                           ; BACKSPACE
+          (aref table #x0F) #x09)                          ; TAB
+    (loop for ch across "qwertyuiop[]"
+          for i from 0
+          do (setf (aref table (+ #x10 i)) (char-code ch)))
+    (setf (aref table #x1C) #x0A)                          ; ENTER -> LF
+    (loop for ch across "asdfghjkl;'`"
+          for i from 0
+          do (setf (aref table (+ #x1E i)) (char-code ch)))
+    (setf (aref table #x2B) #x5C)                          ; backslash
+    (loop for ch across "zxcvbnm,./"
+          for i from 0
+          do (setf (aref table (+ #x2C i)) (char-code ch)))
+    (setf (aref table #x37) #x2A                           ; numpad '*'
+          (aref table #x39) #x20)                          ; SPACE
+    table))
+
+(defun derive-keyboard-label (name suffix)
+  (intern (concatenate 'string (symbol-name name) suffix)
+          (or (symbol-package name) *package*)))
+
+(defun lookup-keyboard (environment name)
+  (or (gethash name (compile-environment-keyboards environment))
+      (error "Unknown keyboard driver ~S — is (keyboard-driver ~S ...) declared in this section?"
+             name name)))
+
+(defun emit-keyboard-handler (environment kbd)
+  (let* ((state (compile-environment-state environment))
+         (eoi-label (gensym "KBD-EOI-"))
+         (handler (keyboard-descriptor-handler-label kbd))
+         (table (keyboard-descriptor-table-label kbd))
+         (buffer (keyboard-descriptor-buffer-label kbd))
+         (tail (keyboard-descriptor-tail-label kbd))
+         (mask (1- (keyboard-descriptor-buffer-size kbd)))
+         (irq (keyboard-descriptor-irq kbd)))
+    (emit-label state handler)
+    (encode-instruction state 'push '(eax))
+    (encode-instruction state 'push '(ebx))
+    (encode-instruction state 'push '(ecx))
+    (encode-instruction state 'in (list 'al #x60))
+    (encode-instruction state 'test '(al #x80))
+    (encode-instruction state 'jnz-near (list eoi-label))
+    (encode-instruction state 'movzx '(ecx al))
+    (encode-instruction state 'mov (list 'ebx table))
+    (encode-instruction state 'mov (list 'bl (list :MEM :BYTE 'ebx 'ecx 1 0)))
+    (encode-instruction state 'test '(bl bl))
+    (encode-instruction state 'jz-near (list eoi-label))
+    (encode-instruction state 'movzx (list 'ecx (list :MEM :BYTE tail)))
+    (encode-instruction state 'mov (list 'eax buffer))
+    (encode-instruction state 'mov (list (list :MEM :BYTE 'eax 'ecx 1 0) 'bl))
+    (encode-instruction state 'inc '(cl))
+    (encode-instruction state 'and (list 'cl mask))
+    (encode-instruction state 'mov (list (list :MEM :BYTE tail) 'cl))
+    (emit-label state eoi-label)
+    (emit-irq-end-of-interrupt environment (list irq))
+    (encode-instruction state 'pop '(ecx))
+    (encode-instruction state 'pop '(ebx))
+    (encode-instruction state 'pop '(eax))
+    (encode-instruction state 'iret '())))
+
+(defun parse-keyboard-driver-form (environment form)
+  (let* ((name (or (second form)
+                   (error "KEYBOARD-DRIVER requires a name.")))
+         (options (resolve-operands environment (third form)))
+         (controller (or (getf options :controller) :ps2))
+         (irq (getf options :irq 1))
+         (buffer-size (getf options :buffer-size 64))
+         (scancode-map (or (getf options :scancode-map) :us-qwerty)))
+    (unless (eq controller :ps2)
+      (error "KEYBOARD-DRIVER currently only supports :PS2, got ~S." controller))
+    (unless (eq scancode-map :us-qwerty)
+      (error "KEYBOARD-DRIVER currently only supports :US-QWERTY, got ~S." scancode-map))
+    (unless (and (integerp buffer-size)
+                 (>= buffer-size 2)
+                 (<= buffer-size 256)
+                 (zerop (logand buffer-size (1- buffer-size))))
+      (error "KEYBOARD-DRIVER :BUFFER-SIZE must be a power of two in 2..256, got ~S." buffer-size))
+    (unless (typep irq '(integer 0 15))
+      (error "KEYBOARD-DRIVER :IRQ must be in 0..15, got ~S." irq))
+    (make-keyboard-descriptor
+     :name name
+     :controller controller
+     :irq irq
+     :buffer-size buffer-size
+     :scancode-map scancode-map
+     :handler-label (derive-keyboard-label name "-HANDLER")
+     :table-label   (derive-keyboard-label name "-TABLE")
+     :buffer-label  (derive-keyboard-label name "-BUFFER")
+     :head-label    (derive-keyboard-label name "-HEAD")
+     :tail-label    (derive-keyboard-label name "-TAIL"))))
+
+(defun register-keyboard-driver (environment form)
+  (let* ((kbd (parse-keyboard-driver-form environment form))
+         (name (keyboard-descriptor-name kbd)))
+    (when (gethash name (compile-environment-keyboards environment))
+      (error "KEYBOARD-DRIVER ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-keyboards environment)) kbd)
+    kbd))
+
+(defun emit-keyboard-driver (environment form)
+  (require-bits environment 32 "KEYBOARD-DRIVER")
+  (let* ((state (compile-environment-state environment))
+         (name (second form))
+         (kbd (lookup-keyboard environment name)))
+    (emit-align state 4)
+    (emit-label state name)
+    (emit-label state (keyboard-descriptor-table-label kbd))
+    (loop for byte across +keyboard-us-qwerty-table+ do
+      (emit-u8 state byte))
+    (emit-label state (keyboard-descriptor-buffer-label kbd))
+    (loop repeat (keyboard-descriptor-buffer-size kbd) do (emit-u8 state 0))
+    (emit-label state (keyboard-descriptor-head-label kbd))
+    (emit-u8 state 0)
+    (emit-label state (keyboard-descriptor-tail-label kbd))
+    (emit-u8 state 0)
+    (emit-keyboard-handler environment kbd)))
+
+(defstruct (block-device-descriptor
+            (:constructor make-block-device-descriptor
+                (&key name type bus addressing sector-size base-port)))
+  name type bus addressing sector-size base-port)
+
+(defun parse-block-device-form (environment form)
+  (let* ((name (or (second form) (error "BLOCK-DEVICE requires a name.")))
+         (options (resolve-operands environment (third form)))
+         (type (or (getf options :type) :ata-pio))
+         (bus (or (getf options :bus) :primary))
+         (addressing (or (getf options :addressing) :lba28))
+         (sector-size (or (getf options :sector-size) 512)))
+    (unless (eq type :ata-pio)
+      (error "BLOCK-DEVICE currently only supports :ATA-PIO, got ~S." type))
+    (unless (eq addressing :lba28)
+      (error "BLOCK-DEVICE currently only supports :LBA28 addressing, got ~S." addressing))
+    (unless (= sector-size 512)
+      (error "BLOCK-DEVICE :SECTOR-SIZE must be 512, got ~S." sector-size))
+    (let ((base-port (ecase bus
+                       (:primary #x1F0)
+                       (:secondary #x170))))
+      (make-block-device-descriptor
+       :name name :type type :bus bus :addressing addressing
+       :sector-size sector-size :base-port base-port))))
+
+(defun register-block-device (environment form)
+  (let* ((dev (parse-block-device-form environment form))
+         (name (block-device-descriptor-name dev)))
+    (when (gethash name (compile-environment-block-devices environment))
+      (error "BLOCK-DEVICE ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-block-devices environment)) dev)
+    dev))
+
+(defun lookup-block-device (environment name)
+  (or (gethash name (compile-environment-block-devices environment))
+      (error "Unknown block device ~S — is (block-device ~S ...) declared in this section?"
+             name name)))
+
+(defun load-into-register (environment dest source)
+  (let ((state (compile-environment-state environment)))
+    (unless (and (symbolp source)
+                 (or (dword-register-p source) (word-register-p source) (byte-register-p source))
+                 (eql (token-keyword source) (token-keyword dest)))
+      (encode-instruction state 'mov (list dest source)))))
+
+(defun emit-ata-pio-transfer (environment dev args read-p)
+  (let* ((rest-args (resolve-operands environment args))
+         (lba-src (or (getf rest-args :lba)
+                      (error "BLOCK-~A requires :LBA." (if read-p "READ" "WRITE"))))
+         (count (or (getf rest-args :count) 1))
+         (buffer-src (or (getf rest-args :buffer)
+                         (error "BLOCK-~A requires :BUFFER." (if read-p "READ" "WRITE"))))
+         (state (compile-environment-state environment))
+         (base (block-device-descriptor-base-port dev))
+         (data-port  (+ base 0))
+         (count-port (+ base 2))
+         (lba0-port  (+ base 3))
+         (lba1-port  (+ base 4))
+         (lba2-port  (+ base 5))
+         (drive-port (+ base 6))
+         (status-port (+ base 7))
+         (cmd-port    (+ base 7))
+         (poll-bsy    (gensym "ATA-BSY-"))
+         (poll-drq    (gensym "ATA-DRQ-"))
+         (sector-loop (gensym "ATA-SECTOR-"))
+         (cmd-byte    (if read-p #x20 #x30))
+         (string-op   (if read-p 'insw 'outsw))
+         (string-reg  (if read-p 'edi 'esi)))
+    (unless (and (integerp count) (>= count 1) (<= count 255))
+      (error "BLOCK transfer :COUNT must be an integer 1..255, got ~S." count))
+    (load-into-register environment 'eax lba-src)
+    (load-into-register environment string-reg buffer-src)
+    (encode-instruction state 'mov (list 'dx status-port))
+    (emit-label state poll-bsy)
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'test '(al #x80))
+    (encode-instruction state 'jnz-near (list poll-bsy))
+    (encode-instruction state 'push '(eax))
+    (encode-instruction state 'mov (list 'dx count-port))
+    (encode-instruction state 'mov (list 'al count))
+    (encode-instruction state 'out '(dx al))
+    (encode-instruction state 'pop '(eax))
+    (encode-instruction state 'mov (list 'dx lba0-port))
+    (encode-instruction state 'out '(dx al))
+    (encode-instruction state 'shr '(eax 8))
+    (encode-instruction state 'mov (list 'dx lba1-port))
+    (encode-instruction state 'out '(dx al))
+    (encode-instruction state 'shr '(eax 8))
+    (encode-instruction state 'mov (list 'dx lba2-port))
+    (encode-instruction state 'out '(dx al))
+    (encode-instruction state 'shr '(eax 8))
+    (encode-instruction state 'and '(al #x0F))
+    (encode-instruction state 'or '(al #xE0))
+    (encode-instruction state 'mov (list 'dx drive-port))
+    (encode-instruction state 'out '(dx al))
+    (encode-instruction state 'mov (list 'dx cmd-port))
+    (encode-instruction state 'mov (list 'al cmd-byte))
+    (encode-instruction state 'out '(dx al))
+    (encode-instruction state 'mov (list 'ebp count))
+    (encode-instruction state 'cld '())
+    (emit-label state sector-loop)
+    (emit-label state poll-drq)
+    (encode-instruction state 'mov (list 'dx status-port))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'test '(al #x80))
+    (encode-instruction state 'jnz-near (list poll-drq))
+    (encode-instruction state 'test '(al #x08))
+    (encode-instruction state 'jz-near (list poll-drq))
+    (encode-instruction state 'mov (list 'dx data-port))
+    (encode-instruction state 'mov (list 'ecx 256))
+    (encode-instruction state 'rep (list string-op))
+    (encode-instruction state 'dec '(ebp))
+    (encode-instruction state 'jnz-near (list sector-loop))
+    (unless read-p
+      ;; ATA cache flush after writes.
+      (encode-instruction state 'mov (list 'dx cmd-port))
+      (encode-instruction state 'mov '(al #xE7))
+      (encode-instruction state 'out '(dx al))
+      (encode-instruction state 'mov (list 'dx status-port))
+      (let ((flush-wait (gensym "ATA-FLUSH-")))
+        (emit-label state flush-wait)
+        (encode-instruction state 'in '(al dx))
+        (encode-instruction state 'test '(al #x80))
+        (encode-instruction state 'jnz-near (list flush-wait))))))
+
+(defun emit-block-read (environment args)
+  (require-bits environment 32 "BLOCK-READ")
+  (let* ((dev-name (or (first args) (error "BLOCK-READ requires a device name.")))
+         (dev (lookup-block-device environment dev-name)))
+    (emit-ata-pio-transfer environment dev (rest args) t)))
+
+(defun emit-block-write (environment args)
+  (require-bits environment 32 "BLOCK-WRITE")
+  (let* ((dev-name (or (first args) (error "BLOCK-WRITE requires a device name.")))
+         (dev (lookup-block-device environment dev-name)))
+    (emit-ata-pio-transfer environment dev (rest args) nil)))
+
+(defun pre-scan-section (environment body)
+  (dolist (form body)
+    (when (consp form)
+      (case (token-keyword (first form))
+        (:keyboard-driver
+         (register-keyboard-driver environment form))
+        (:block-device
+         (register-block-device environment form))))))
+
+(defun emit-keyboard-read (environment args)
+  (require-bits environment 32 "KEYBOARD-READ")
+  (let* ((state (compile-environment-state environment))
+         (kbd-name (or (first args)
+                       (error "KEYBOARD-READ requires a driver name.")))
+         (dest (resolve-operand environment
+                                (or (second args)
+                                    (error "KEYBOARD-READ requires a destination byte register."))))
+         (kbd (lookup-keyboard environment kbd-name))
+         (mask (1- (keyboard-descriptor-buffer-size kbd)))
+         (head (keyboard-descriptor-head-label kbd))
+         (tail (keyboard-descriptor-tail-label kbd))
+         (buffer (keyboard-descriptor-buffer-label kbd))
+         (wait-label (gensym "KBD-WAIT-")))
+    (unless (byte-register-p dest)
+      (error "KEYBOARD-READ destination must be a byte register, got ~S." dest))
+    (emit-label state wait-label)
+    (encode-instruction state 'mov (list 'al (list :MEM :BYTE head)))
+    (encode-instruction state 'cmp (list 'al (list :MEM :BYTE tail)))
+    (encode-instruction state 'je (list wait-label))
+    (encode-instruction state 'movzx '(ecx al))
+    (encode-instruction state 'mov (list 'ebx buffer))
+    (encode-instruction state 'mov (list dest (list :MEM :BYTE 'ebx 'ecx 1 0)))
+    (encode-instruction state 'inc '(cl))
+    (encode-instruction state 'and (list 'cl mask))
+    (encode-instruction state 'mov (list (list :MEM :BYTE head) 'cl))))
+
+(defun emit-keyboard-poll (environment args)
+  (require-bits environment 32 "KEYBOARD-POLL")
+  (let* ((state (compile-environment-state environment))
+         (kbd-name (or (first args)
+                       (error "KEYBOARD-POLL requires a driver name.")))
+         (dest (resolve-operand environment
+                                (or (second args)
+                                    (error "KEYBOARD-POLL requires a destination byte register."))))
+         (rest-args (resolve-operands environment (cddr args)))
+         (empty-label (or (getf rest-args :empty)
+                          (error "KEYBOARD-POLL requires an :EMPTY label.")))
+         (kbd (lookup-keyboard environment kbd-name))
+         (mask (1- (keyboard-descriptor-buffer-size kbd)))
+         (head (keyboard-descriptor-head-label kbd))
+         (tail (keyboard-descriptor-tail-label kbd))
+         (buffer (keyboard-descriptor-buffer-label kbd)))
+    (unless (byte-register-p dest)
+      (error "KEYBOARD-POLL destination must be a byte register, got ~S." dest))
+    (encode-instruction state 'mov (list 'al (list :MEM :BYTE head)))
+    (encode-instruction state 'cmp (list 'al (list :MEM :BYTE tail)))
+    (encode-instruction state 'je-near (list empty-label))
+    (encode-instruction state 'movzx '(ecx al))
+    (encode-instruction state 'mov (list 'ebx buffer))
+    (encode-instruction state 'mov (list dest (list :MEM :BYTE 'ebx 'ecx 1 0)))
+    (encode-instruction state 'inc '(cl))
+    (encode-instruction state 'and (list 'cl mask))
+    (encode-instruction state 'mov (list (list :MEM :BYTE head) 'cl))))
+
 (defun ensure-floppy-track-range (layout)
   (let ((last-sector (+ (section-layout-start-lba layout)
                         (section-layout-sector-count layout))))
@@ -1689,6 +2077,14 @@
        (emit-enable-paging environment (rest form)))
       (:load-idt
        (emit-load-idt environment (rest form)))
+      (:memory-barrier
+       (emit-memory-barrier environment (rest form)))
+      (:tlb-flush-page
+       (emit-tlb-flush-page environment (rest form)))
+      (:tlb-flush-all
+       (emit-tlb-flush-all environment))
+      (:load-tr
+       (emit-load-tr environment (rest form)))
       (:pic-remap
        (emit-pic-remap environment (rest form)))
       (:pic-mask-all
@@ -1717,6 +2113,19 @@
        (emit-timer-disable environment))
       (:timer-read-counter
        (emit-timer-read-counter environment (rest form)))
+      (:keyboard-driver
+       (emit-keyboard-driver environment form))
+      (:keyboard-read
+       (emit-keyboard-read environment (rest form)))
+      (:keyboard-poll
+       (emit-keyboard-poll environment (rest form)))
+      (:block-device
+       ;; Pre-scan already registered the descriptor; no code/data emitted.
+       nil)
+      (:block-read
+       (emit-block-read environment (rest form)))
+      (:block-write
+       (emit-block-write environment (rest form)))
       (:load-section
        (destructuring-bind (_ section-name &rest args) form
          (declare (ignore _))
@@ -1741,7 +2150,10 @@
         :layouts layouts
         :state state
         :helpers (make-hash-table :test 'eq)
-        :constants (make-hash-table :test 'eq))))
+        :constants (make-hash-table :test 'eq)
+        :keyboards (make-hash-table :test 'eq)
+        :block-devices (make-hash-table :test 'eq))))
+    (pre-scan-section environment (section-spec-body section))
     (dolist (form (section-spec-body section))
       (compile-form environment form))
     (emit-required-helpers environment)
