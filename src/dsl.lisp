@@ -3,7 +3,8 @@
 (defstruct (compile-environment
             (:constructor make-compile-environment
                 (&key target section layouts state helpers constants keyboards
-                      block-devices memory-maps phys-allocators syscall-tables)))
+                      block-devices memory-maps phys-allocators syscall-tables
+                      slot-types partition-tables volumes)))
   target
   section
   layouts
@@ -14,7 +15,10 @@
   block-devices
   memory-maps
   phys-allocators
-  syscall-tables)
+  syscall-tables
+  slot-types
+  partition-tables
+  volumes)
 
 (defun helper-needed-p (environment helper)
   (gethash helper (compile-environment-helpers environment)))
@@ -180,6 +184,16 @@
     (loop repeat padding do
       (emit-u8 state fill))))
 
+(defun emit-pad-to (state target-offset &optional (fill 0))
+  "Emit FILL bytes until the section's current offset reaches TARGET-OFFSET.
+Errors if the current offset is already past TARGET-OFFSET."
+  (let* ((current (assembly-offset state))
+         (padding (- target-offset current)))
+    (when (minusp padding)
+      (error "PAD-TO ~D underflows: section already at offset ~D." target-offset current))
+    (loop repeat padding do
+      (emit-u8 state fill))))
+
 (defun descriptor-base (environment value)
   (cond ((or (null value) (eql value 0))
          0)
@@ -200,6 +214,25 @@
   (emit-u8 state (logior (ldb (byte 4 16) limit)
                          (ash flags 4)))
   (emit-u8 state (ldb (byte 8 24) base)))
+
+(defun emit-segment-descriptor-with-label-base (state label limit access flags)
+  "Emit an 8-byte segment/system descriptor whose base field references a label
+by linear address. Three fixups patch base[15:0], base[23:16], and base[31:24]."
+  (unless (typep limit '(integer 0 #xFFFFF))
+    (error "Descriptor limit must fit in 20 bits, got ~S." limit))
+  (emit-u16 state (ldb (byte 16 0) limit))
+  (let ((low16-pos (assembly-offset state)))
+    (emit-u16 state 0)
+    (add-fixup state :linear-low16 label low16-pos))
+  (let ((mid8-pos (assembly-offset state)))
+    (emit-u8 state 0)
+    (add-fixup state :linear-mid8 label mid8-pos))
+  (emit-u8 state access)
+  (emit-u8 state (logior (ldb (byte 4 16) limit)
+                         (ash flags 4)))
+  (let ((high8-pos (assembly-offset state)))
+    (emit-u8 state 0)
+    (add-fixup state :linear-high8 label high8-pos)))
 
 (defun make-segment-access-byte (kind options)
   (let* ((dpl (getf options :dpl 0))
@@ -280,6 +313,15 @@
         (getf options :limit #xFFFF)
         (make-segment-access-byte :data options)
         (make-segment-flags-nibble options)))
+      (:tss
+       (let* ((label (or (getf options :label)
+                         (error ":TSS GDT entry requires :LABEL.")))
+              (dpl (getf options :dpl 0))
+              (access (logior #x80 (ash dpl 5) #x09))
+              (limit (getf options :limit 103)))
+         (unless (symbolp label)
+           (error ":TSS GDT entry expects a label symbol, got ~S." label))
+         (emit-segment-descriptor-with-label-base state label limit access 0)))
       (t
        (error "Unsupported GDT entry kind ~S." (first descriptor))))))
 
@@ -435,6 +477,13 @@
       (encode-instruction state 'int '(#x10))
       (encode-instruction state 'jmp (list loop-label))
       (emit-label state done-label)
+      ;; Append CR LF so each BIOS-PRINT produces a complete line.
+      (encode-instruction state 'mov '(ah #x0E))
+      (encode-instruction state 'mov '(al #x0D))
+      (encode-instruction state 'int '(#x10))
+      (encode-instruction state 'mov '(ah #x0E))
+      (encode-instruction state 'mov '(al #x0A))
+      (encode-instruction state 'int '(#x10))
       (encode-instruction state 'ret '()))))
 
 (defun emit-debug-print-helper (environment)
@@ -617,7 +666,8 @@
             (:vga-print-decimal
              (emit-vga-print-decimal-helper environment))
             (:serial-print-z
-             (emit-serial-print-helper environment))))))))
+             (emit-serial-print-helper environment)))
+          (remhash helper helpers))))))
 
 (defun print-label-designator (designator)
   (cond ((symbolp designator)
@@ -1011,6 +1061,144 @@
           (t
            (error "LOAD-TR expects an integer selector, 16-bit register, or memory operand, got ~S."
                   selector)))))
+
+(defun emit-wrmsr-32 (state msr-index value)
+  "Emit MOV ECX,msr; MOV EAX,low32(value); MOV EDX,0; WRMSR.
+VALUE may be an integer or a label/linear reference (treated as 32-bit immediate)."
+  (encode-instruction state 'mov (list 'ecx msr-index))
+  (encode-instruction state 'mov (list 'eax value))
+  (encode-instruction state 'mov (list 'edx 0))
+  (encode-instruction state 'wrmsr '()))
+
+(defun ensure-linear-immediate (value)
+  "Promote a bare label symbol to a (:linear label) reference so the assembler
+patches the linear address rather than the section-relative offset.  Integers
+and explicit (:linear ...) / (:linear+ ...) forms pass through unchanged."
+  (cond ((integerp value) value)
+        ((and (symbolp value) (not (keywordp value))) (list :linear value))
+        (t value)))
+
+(defun emit-sysenter-setup (environment args)
+  "Program IA32_SYSENTER_CS/ESP/EIP for the SYSENTER fast-call path.
+SYSENTER hardcodes the new CS.Base to 0, so :HANDLER-LINEAR must be a true
+linear address — labels are auto-promoted to (:linear label)."
+  (require-bits environment 32 "SYSENTER-SETUP")
+  (let* ((args (resolve-operands environment args))
+         (state (compile-environment-state environment))
+         (kernel-cs (or (getf args :kernel-cs)
+                        (error "SYSENTER-SETUP requires :KERNEL-CS.")))
+         (kernel-stack (ensure-linear-immediate
+                        (or (getf args :kernel-stack)
+                            (error "SYSENTER-SETUP requires :KERNEL-STACK."))))
+         (handler (ensure-linear-immediate
+                   (or (getf args :handler-linear)
+                       (error "SYSENTER-SETUP requires :HANDLER-LINEAR.")))))
+    (emit-wrmsr-32 state #x174 kernel-cs)
+    (emit-wrmsr-32 state #x175 kernel-stack)
+    (emit-wrmsr-32 state #x176 handler)))
+
+(defun emit-syscall-setup (environment args)
+  "Program IA32_STAR/LSTAR/FMASK and set EFER.SCE for the SYSCALL/SYSRET path.
+The form emits valid WRMSR sequences on x86-32; SYSCALL execution itself
+requires long mode (Phase 1: x86-64 backend)."
+  (require-bits environment 32 "SYSCALL-SETUP")
+  (let* ((args (resolve-operands environment args))
+         (state (compile-environment-state environment))
+         (kernel-cs (or (getf args :kernel-cs)
+                        (error "SYSCALL-SETUP requires :KERNEL-CS.")))
+         (user-cs (or (getf args :user-cs)
+                      (error "SYSCALL-SETUP requires :USER-CS.")))
+         (handler (or (getf args :handler-linear)
+                      (error "SYSCALL-SETUP requires :HANDLER-LINEAR.")))
+         (flags-mask (getf args :flags-mask 0)))
+    (unless (and (integerp kernel-cs) (typep kernel-cs '(integer 0 #xFFFF)))
+      (error "SYSCALL-SETUP :KERNEL-CS must be a 16-bit integer, got ~S." kernel-cs))
+    (unless (and (integerp user-cs) (typep user-cs '(integer 0 #xFFFF)))
+      (error "SYSCALL-SETUP :USER-CS must be a 16-bit integer, got ~S." user-cs))
+    ;; IA32_STAR (0xC0000081): bits 47:32 = kernel-cs, bits 63:48 = user-cs.
+    ;; On x86-32 we still write the low 32 (zero) and high 32 (the selectors).
+    (let ((star-high (logior (ldb (byte 16 0) kernel-cs)
+                             (ash (ldb (byte 16 0) user-cs) 16))))
+      (encode-instruction state 'mov (list 'ecx #xC0000081))
+      (encode-instruction state 'mov (list 'eax 0))
+      (encode-instruction state 'mov (list 'edx star-high))
+      (encode-instruction state 'wrmsr '()))
+    ;; IA32_LSTAR (0xC0000082) = handler-linear (low 32; high 32 = 0 in our setup).
+    (emit-wrmsr-32 state #xC0000082 (ensure-linear-immediate handler))
+    ;; IA32_FMASK (0xC0000084) = flags-mask.
+    (emit-wrmsr-32 state #xC0000084 flags-mask)
+    ;; IA32_EFER (0xC0000080): set SCE (bit 0). Read-modify-write.
+    (encode-instruction state 'mov (list 'ecx #xC0000080))
+    (encode-instruction state 'rdmsr '())
+    (encode-instruction state 'or (list 'eax 1))
+    (encode-instruction state 'wrmsr '())))
+
+(defun emit-privilege-drop (environment args)
+  "Emit the IRET-based ring-0 → ring-3 transition.
+Pushes SS3, ESP3, EFLAGS, CS3, EIP3 then IRETs."
+  (require-bits environment 32 "PRIVILEGE-DROP")
+  (let* ((args (resolve-operands environment args))
+         (state (compile-environment-state environment))
+         (data-selector (or (getf args :data-selector)
+                            (error "PRIVILEGE-DROP requires :DATA-SELECTOR.")))
+         (code-selector (or (getf args :code-selector)
+                            (error "PRIVILEGE-DROP requires :CODE-SELECTOR.")))
+         (stack-linear (or (getf args :stack-linear)
+                           (error "PRIVILEGE-DROP requires :STACK-LINEAR.")))
+         (entry-point (or (getf args :entry-point)
+                          (error "PRIVILEGE-DROP requires :ENTRY-POINT.")))
+         (eflags (getf args :eflags #x202)))
+    (when (and (integerp data-selector)
+               (not (typep data-selector '(integer 0 #xFFFF))))
+      (error "PRIVILEGE-DROP :DATA-SELECTOR must fit in 16 bits, got ~S." data-selector))
+    (when (and (integerp code-selector)
+               (not (typep code-selector '(integer 0 #xFFFF))))
+      (error "PRIVILEGE-DROP :CODE-SELECTOR must fit in 16 bits, got ~S." code-selector))
+    (encode-instruction state 'push (list data-selector))
+    (encode-instruction state 'push (list stack-linear))
+    (encode-instruction state 'push (list eflags))
+    (encode-instruction state 'push (list code-selector))
+    (encode-instruction state 'push (list entry-point))
+    (encode-instruction state 'iret '())))
+
+(defparameter +tss-bytes+ 104)
+
+(defun emit-tss (environment form)
+  "Emit a 104-byte 32-bit available TSS labeled NAME.
+Layout:
+  0x04  ESP0  : :RING0-STACK-LINEAR    (linear address of ring-0 stack top)
+  0x08  SS0   : :RING0-STACK-SELECTOR  (kernel data selector)
+  0x66  IOPB  : 104 (effectively no I/O permission bitmap)
+All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
+  (let* ((state (compile-environment-state environment))
+         (name (or (second form)
+                   (error "TSS requires a name.")))
+         (raw-options (cddr form))
+         (option-plist (if (and (consp (first raw-options))
+                                (let ((k (ignore-errors (token-keyword (first (first raw-options))))))
+                                  (and k (keywordp k))))
+                           (first raw-options)
+                           raw-options))
+         (esp0 (or (getf option-plist :ring0-stack-linear)
+                   (error "TSS ~S requires :RING0-STACK-LINEAR." name)))
+         (ss0-form (or (getf option-plist :ring0-stack-selector)
+                       (error "TSS ~S requires :RING0-STACK-SELECTOR." name)))
+         (ss0 (resolve-operand environment ss0-form)))
+    (unless (and (integerp ss0) (typep ss0 '(integer 0 #xFFFF)))
+      (error "TSS :RING0-STACK-SELECTOR must be a 16-bit integer, got ~S." ss0-form))
+    (emit-align state 4)
+    (emit-label state name)
+    ;; 0x00 LINK (16) + reserved (16)
+    (emit-u32 state 0)
+    ;; 0x04 ESP0
+    (emit-imm32 state (resolve-operand environment esp0))
+    ;; 0x08 SS0 (16) + reserved (16)
+    (emit-u16 state ss0)
+    (emit-u16 state 0)
+    ;; 0x0C..0x65 zero — ESP1/SS1/ESP2/SS2/CR3/EIP/EFLAGS/regs/segs/LDT/T-flag
+    (loop repeat (- #x66 #xC) do (emit-u8 state 0))
+    ;; 0x66 IOPB offset = +tss-bytes+ (no IOPB)
+    (emit-u16 state +tss-bytes+)))
 
 (defun ensure-pic8259-controller (controller)
   (unless (typep controller 'pic8259-controller)
@@ -1721,13 +1909,16 @@
       (error "BLOCK transfer :COUNT must be an integer 1..255, got ~S." count))
     (load-into-register environment 'eax lba-src)
     (load-into-register environment string-reg buffer-src)
+    ;; BSY poll clobbers AL — preserve caller's EAX (which holds LBA).
+    (encode-instruction state 'push '(eax))
     (encode-instruction state 'mov (list 'dx status-port))
     (emit-label state poll-bsy)
     (encode-instruction state 'in '(al dx))
     (encode-instruction state 'test '(al #x80))
     (encode-instruction state 'jnz-near (list poll-bsy))
-    (encode-instruction state 'push '(eax))
+    (encode-instruction state 'pop '(eax))
     (encode-instruction state 'mov (list 'dx count-port))
+    (encode-instruction state 'push '(eax))
     (encode-instruction state 'mov (list 'al count))
     (encode-instruction state 'out '(dx al))
     (encode-instruction state 'pop '(eax))
@@ -1744,9 +1935,22 @@
     (encode-instruction state 'or '(al #xE0))
     (encode-instruction state 'mov (list 'dx drive-port))
     (encode-instruction state 'out '(dx al))
+    ;; ATA spec: after drive-select, wait >=400ns before reading status.
+    ;; Read alt-status (0x3F6) 4 times — non-destructive, doesn't clear IRQ.
+    (encode-instruction state 'mov (list 'dx #x3F6))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'in '(al dx))
     (encode-instruction state 'mov (list 'dx cmd-port))
     (encode-instruction state 'mov (list 'al cmd-byte))
     (encode-instruction state 'out '(dx al))
+    ;; 400ns delay after command — let BSY rise.
+    (encode-instruction state 'mov (list 'dx #x3F6))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'in '(al dx))
     (encode-instruction state 'mov (list 'ebp count))
     (encode-instruction state 'cld '())
     (emit-label state sector-loop)
@@ -1785,6 +1989,290 @@
   (let* ((dev-name (or (first args) (error "BLOCK-WRITE requires a device name.")))
          (dev (lookup-block-device environment dev-name)))
     (emit-ata-pio-transfer environment dev (rest args) nil)))
+
+;;;; ----------------------------------------------------------------
+;;;; Phase 6 — Storage and persistence
+;;;;
+;;;;   (partition-table NAME (:device DEV :format :mbr))
+;;;;   (partition-table-read NAME)
+;;;;   (partition-find NAME :type N :result-lba REG :result-count REG)
+;;;;
+;;;;   (volume NAME (:partition-table TBL :partition INDEX
+;;;;                 :cache-buffer ADDR :cache-size N))
+;;;;   (volume-read NAME :lba REG :buffer REG)
+;;;;   (volume-write NAME :lba REG :buffer REG)
+;;;;
+;;;; The DSL is filesystem-agnostic.  Filesystem implementations live above
+;;;; this layer.
+;;;; ----------------------------------------------------------------
+
+(defstruct (partition-table-descriptor
+            (:constructor make-partition-table-descriptor
+                (&key name device format buffer-label parsed-p)))
+  name
+  device
+  format
+  buffer-label
+  ;; runtime-parsed-flag word label (set by partition-table-read on success)
+  parsed-p)
+
+(defun parse-partition-table-form (environment form)
+  (let* ((name (or (second form) (error "PARTITION-TABLE requires a name.")))
+         (options (resolve-operands environment (third form)))
+         (device (or (getf options :device)
+                     (error "PARTITION-TABLE ~S requires :DEVICE." name)))
+         (format (or (getf options :format) :mbr))
+         (pkg (or (symbol-package name) *package*)))
+    (unless (eq format :mbr)
+      (error "PARTITION-TABLE ~S only supports :MBR, got ~S." name format))
+    (make-partition-table-descriptor
+     :name name
+     :device device
+     :format format
+     :buffer-label (intern (concatenate 'string (symbol-name name) "-MBR-BUFFER") pkg)
+     :parsed-p (intern (concatenate 'string (symbol-name name) "-MBR-VALID") pkg))))
+
+(defun register-partition-table (environment form)
+  (let* ((tbl (parse-partition-table-form environment form))
+         (name (partition-table-descriptor-name tbl)))
+    (when (gethash name (compile-environment-partition-tables environment))
+      (error "PARTITION-TABLE ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-partition-tables environment)) tbl)
+    tbl))
+
+(defun lookup-partition-table (environment name)
+  (or (gethash name (compile-environment-partition-tables environment))
+      (error "Unknown PARTITION-TABLE ~S — declare (partition-table ~S ...) in this section."
+             name name)))
+
+(defun emit-partition-table (environment form)
+  "Emit the runtime data block for a partition table: 512-byte sector buffer
+plus a 4-byte parsed flag.  Pure data — no bit-mode requirement.
+Code lives in PARTITION-TABLE-READ etc."
+  (let* ((state (compile-environment-state environment))
+         (name (second form))
+         (tbl (lookup-partition-table environment name)))
+    (emit-align state 4)
+    (emit-label state name)
+    (emit-label state (partition-table-descriptor-buffer-label tbl))
+    (loop repeat 512 do (emit-u8 state 0))
+    (emit-label state (partition-table-descriptor-parsed-p tbl))
+    (emit-u8 state 0)
+    (emit-u8 state 0)
+    (emit-u8 state 0)
+    (emit-u8 state 0)))
+
+(defun emit-partition-table-read (environment args)
+  "Read a sector containing a partition table from the device into the
+partition-table buffer and validate the 0xAA55 signature.  Default LBA is 0
+(MBR convention); override with :LBA.  On success sets AL=1 and the
+descriptor's parsed flag; on failure sets AL=0.  ZF reflects AL (caller
+branches with JZ for failure)."
+  (require-bits environment 32 "PARTITION-TABLE-READ")
+  (let* ((tbl-name (or (first args)
+                       (error "PARTITION-TABLE-READ requires a table name.")))
+         (rest-args (resolve-operands environment (rest args)))
+         (lba (getf rest-args :lba 0))
+         (tbl (lookup-partition-table environment tbl-name))
+         (state (compile-environment-state environment))
+         (buffer (partition-table-descriptor-buffer-label tbl))
+         (parsed (partition-table-descriptor-parsed-p tbl))
+         (device (partition-table-descriptor-device tbl))
+         (fail-label (gensym "PT-FAIL-"))
+         (done-label (gensym "PT-DONE-")))
+    (emit-block-read environment
+                     (list device
+                           :lba lba
+                           :count 1
+                           :buffer buffer))
+    (encode-instruction state 'mov (list 'eax buffer))
+    (encode-instruction state 'mov (list 'ax (list :MEM :word 'eax 510)))
+    (encode-instruction state 'cmp (list 'ax #xAA55))
+    (encode-instruction state 'jne-near (list fail-label))
+    (encode-instruction state 'mov (list (list :MEM :byte parsed) 1))
+    (encode-instruction state 'mov '(al 1))
+    (encode-instruction state 'jmp (list done-label))
+    (emit-label state fail-label)
+    (encode-instruction state 'mov (list (list :MEM :byte parsed) 0))
+    (encode-instruction state 'xor '(al al))
+    (emit-label state done-label)
+    (encode-instruction state 'test '(al al))))
+
+(defparameter +mbr-partition-table-offset+ #x1BE)
+(defparameter +mbr-partition-entry-size+ 16)
+(defparameter +mbr-partition-entry-count+ 4)
+
+(defun emit-partition-find (environment args)
+  "Scan the four MBR partition entries for one whose type byte equals :TYPE.
+On match: :RESULT-LBA <- entry's start LBA, :RESULT-COUNT <- entry's count,
+AL=1, ZF=0.  On miss: registers untouched, AL=0, ZF=1.
+Clobbers ESI."
+  (require-bits environment 32 "PARTITION-FIND")
+  (let* ((tbl-name (or (first args)
+                       (error "PARTITION-FIND requires a table name as the first argument.")))
+         (rest-args (resolve-operands environment (rest args)))
+         (tbl (lookup-partition-table environment tbl-name))
+         (type-byte (or (getf rest-args :type)
+                        (error "PARTITION-FIND requires :TYPE.")))
+         (result-lba (or (getf rest-args :result-lba)
+                         (error "PARTITION-FIND requires :RESULT-LBA register.")))
+         (result-count (or (getf rest-args :result-count)
+                           (error "PARTITION-FIND requires :RESULT-COUNT register.")))
+         (state (compile-environment-state environment))
+         (buffer (partition-table-descriptor-buffer-label tbl))
+         (loop-label (gensym "PT-FIND-LOOP-"))
+         (next-label (gensym "PT-FIND-NEXT-"))
+         (found-label (gensym "PT-FIND-OK-"))
+         (miss-label (gensym "PT-FIND-MISS-"))
+         (done-label (gensym "PT-FIND-DONE-")))
+    (unless (and (integerp type-byte) (typep type-byte '(integer 0 255)))
+      (error "PARTITION-FIND :TYPE must be an unsigned byte, got ~S." type-byte))
+    (unless (dword-register-p result-lba)
+      (error "PARTITION-FIND :RESULT-LBA must be a 32-bit register, got ~S." result-lba))
+    (unless (dword-register-p result-count)
+      (error "PARTITION-FIND :RESULT-COUNT must be a 32-bit register, got ~S." result-count))
+    (encode-instruction state 'mov (list 'esi buffer))
+    (encode-instruction state 'add (list 'esi +mbr-partition-table-offset+))
+    (encode-instruction state 'mov (list 'ecx +mbr-partition-entry-count+))
+    (emit-label state loop-label)
+    (encode-instruction state 'mov '(al (:mem :byte esi 4)))   ; type byte at +4
+    (encode-instruction state 'cmp (list 'al type-byte))
+    (encode-instruction state 'je-near (list found-label))
+    (emit-label state next-label)
+    (encode-instruction state 'add (list 'esi +mbr-partition-entry-size+))
+    (encode-instruction state 'dec '(ecx))
+    (encode-instruction state 'jnz-near (list loop-label))
+    (emit-label state miss-label)
+    (encode-instruction state 'xor '(al al))
+    (encode-instruction state 'jmp (list done-label))
+    (emit-label state found-label)
+    (encode-instruction state 'mov (list result-lba (list :MEM :dword 'esi 8)))
+    (encode-instruction state 'mov (list result-count (list :MEM :dword 'esi 12)))
+    (encode-instruction state 'mov '(al 1))
+    (emit-label state done-label)
+    (encode-instruction state 'test '(al al))))
+
+(defstruct (volume-descriptor
+            (:constructor make-volume-descriptor
+                (&key name partition-table partition-index device
+                      cache-buffer cache-size start-lba-label)))
+  name
+  partition-table
+  partition-index
+  device
+  cache-buffer
+  cache-size
+  start-lba-label)
+
+(defun parse-volume-form (environment form)
+  (let* ((name (or (second form) (error "VOLUME requires a name.")))
+         (options (resolve-operands environment (third form)))
+         (table-name (getf options :partition-table))
+         (partition-index (getf options :partition))
+         (device (getf options :device))
+         (cache-buffer (getf options :cache-buffer))
+         (cache-size (or (getf options :cache-size) 512))
+         (pkg (or (symbol-package name) *package*)))
+    (unless (or device table-name)
+      (error "VOLUME ~S requires :DEVICE or :PARTITION-TABLE." name))
+    (when (and table-name partition-index
+               (not (and (integerp partition-index)
+                         (typep partition-index '(integer 0 3)))))
+      (error "VOLUME ~S :PARTITION must be 0..3 for MBR, got ~S." name partition-index))
+    (make-volume-descriptor
+     :name name
+     :partition-table table-name
+     :partition-index partition-index
+     :device device
+     :cache-buffer cache-buffer
+     :cache-size cache-size
+     :start-lba-label (intern (concatenate 'string (symbol-name name) "-START-LBA") pkg))))
+
+(defun register-volume (environment form)
+  (let* ((vol (parse-volume-form environment form))
+         (name (volume-descriptor-name vol)))
+    (when (gethash name (compile-environment-volumes environment))
+      (error "VOLUME ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-volumes environment)) vol)
+    vol))
+
+(defun lookup-volume (environment name)
+  (or (gethash name (compile-environment-volumes environment))
+      (error "Unknown VOLUME ~S — declare (volume ~S ...) in this section."
+             name name)))
+
+(defun volume-effective-device (environment vol)
+  (or (volume-descriptor-device vol)
+      (let ((tbl-name (volume-descriptor-partition-table vol)))
+        (and tbl-name
+             (partition-table-descriptor-device
+              (lookup-partition-table environment tbl-name))))
+      (error "VOLUME ~S has neither :DEVICE nor reachable :PARTITION-TABLE."
+             (volume-descriptor-name vol))))
+
+(defun emit-volume (environment form)
+  "Emit the runtime metadata for a volume: a 4-byte START-LBA cell.
+Set by VOLUME-BIND from the parsed partition table.  Pure data — no bit-mode
+requirement.  Cache buffer is left to the OS author."
+  (let* ((state (compile-environment-state environment))
+         (name (second form))
+         (vol (lookup-volume environment name)))
+    (emit-align state 4)
+    (emit-label state name)
+    (emit-label state (volume-descriptor-start-lba-label vol))
+    (emit-u8 state 0) (emit-u8 state 0) (emit-u8 state 0) (emit-u8 state 0)))
+
+(defun emit-volume-bind (environment args)
+  "Copy a volume's partition start LBA from the parsed sector buffer into the
+volume's runtime START-LBA cell."
+  (require-bits environment 32 "VOLUME-BIND")
+  (let* ((vol-name (or (first args)
+                       (error "VOLUME-BIND requires a volume name as the first argument.")))
+         (vol (lookup-volume environment vol-name))
+         (state (compile-environment-state environment))
+         (tbl-name (or (volume-descriptor-partition-table vol)
+                       (error "VOLUME ~S has no :PARTITION-TABLE — cannot bind." vol-name)))
+         (tbl (lookup-partition-table environment tbl-name))
+         (idx (or (volume-descriptor-partition-index vol)
+                  (error "VOLUME ~S requires :PARTITION index for binding." vol-name)))
+         (entry-offset (+ +mbr-partition-table-offset+
+                          (* idx +mbr-partition-entry-size+)
+                          8)) ; +8 = LBA-start field
+         (start-cell (volume-descriptor-start-lba-label vol)))
+    (encode-instruction state 'mov (list 'esi (partition-table-descriptor-buffer-label tbl)))
+    (encode-instruction state 'mov (list 'eax (list :MEM :dword 'esi entry-offset)))
+    (encode-instruction state 'mov (list (list :MEM :dword start-cell) 'eax))))
+
+(defun emit-volume-transfer (environment args read-p)
+  (require-bits environment 32 (if read-p "VOLUME-READ" "VOLUME-WRITE"))
+  (let* ((args (resolve-operands environment args))
+         (vol-name (or (first args)
+                       (error "VOLUME-~A requires a volume name."
+                              (if read-p "READ" "WRITE"))))
+         (vol (lookup-volume environment vol-name))
+         (rest-args (rest args))
+         (lba-src (or (getf rest-args :lba)
+                      (error "VOLUME-~A requires :LBA." (if read-p "READ" "WRITE"))))
+         (count (or (getf rest-args :count) 1))
+         (buffer-src (or (getf rest-args :buffer)
+                         (error "VOLUME-~A requires :BUFFER." (if read-p "READ" "WRITE"))))
+         (state (compile-environment-state environment))
+         (device (volume-effective-device environment vol))
+         (start-cell (volume-descriptor-start-lba-label vol)))
+    (load-into-register environment 'eax lba-src)
+    (when (volume-descriptor-partition-table vol)
+      (encode-instruction state 'add (list 'eax (list :MEM :dword start-cell))))
+    (if read-p
+        (emit-block-read environment
+                         (list device :lba 'eax :count count :buffer buffer-src))
+        (emit-block-write environment
+                          (list device :lba 'eax :count count :buffer buffer-src)))))
+
+(defun emit-volume-read (environment args)
+  (emit-volume-transfer environment args t))
+
+(defun emit-volume-write (environment args)
+  (emit-volume-transfer environment args nil))
 
 (defstruct (memory-map-descriptor
             (:constructor make-memory-map-descriptor
@@ -2047,13 +2535,72 @@
 
 (defparameter +execution-slot-bytes+ 24)
 
+(defstruct (slot-type-descriptor
+            (:constructor make-slot-type-descriptor
+                (&key name extra-fields total-bytes)))
+  name extra-fields total-bytes)
+
+(defun slot-field-width (kind)
+  (ecase (token-keyword kind)
+    (:uint8 1)
+    (:uint16 2)
+    (:uint32 4)
+    (:uint64 8)))
+
+(defun parse-slot-type-form (form)
+  (let* ((name (or (second form)
+                   (error "EXECUTION-SLOT-TYPE requires a name.")))
+         (clauses (cddr form))
+         (extras nil))
+    (dolist (clause clauses)
+      (let ((kind (token-keyword (first clause))))
+        (case kind
+          (:extra-fields
+           (dolist (field-form (rest clause))
+             (destructuring-bind (field-kw field-name field-type) field-form
+               (unless (eq (token-keyword field-kw) :field)
+                 (error "EXECUTION-SLOT-TYPE field clause must start with :FIELD, got ~S." field-kw))
+               (push (cons field-name (slot-field-width field-type)) extras))))
+          (t
+           (error "Unsupported EXECUTION-SLOT-TYPE clause ~S." (first clause))))))
+    (let* ((extras (nreverse extras))
+           (extras-bytes (reduce #'+ extras :key #'cdr :initial-value 0))
+           (total (+ +execution-slot-bytes+ extras-bytes)))
+      (make-slot-type-descriptor :name name
+                                 :extra-fields extras
+                                 :total-bytes total))))
+
+(defun register-slot-type (environment form)
+  (let* ((descriptor (parse-slot-type-form form))
+         (name (slot-type-descriptor-name descriptor)))
+    (when (gethash name (compile-environment-slot-types environment))
+      (error "EXECUTION-SLOT-TYPE ~S already declared in this section." name))
+    (setf (gethash name (compile-environment-slot-types environment)) descriptor)
+    descriptor))
+
+(defun lookup-slot-type (environment name)
+  (or (gethash name (compile-environment-slot-types environment))
+      (error "Unknown EXECUTION-SLOT-TYPE ~S — declare (execution-slot-type ~S ...) in this section."
+             name name)))
+
+(defun emit-execution-slot-type (environment form)
+  ;; Pre-scan registers; nothing to emit at form site.
+  (declare (ignore environment form))
+  nil)
+
 (defun emit-execution-slot (environment form)
   (let* ((state (compile-environment-state environment))
          (name (or (second form)
-                   (error "EXECUTION-SLOT requires a name."))))
+                   (error "EXECUTION-SLOT requires a name.")))
+         (options (resolve-operands environment (cddr form)))
+         (type-name (getf options :type))
+         (bytes (if type-name
+                    (slot-type-descriptor-total-bytes
+                     (lookup-slot-type environment type-name))
+                    +execution-slot-bytes+)))
     (emit-align state 4)
     (emit-label state name)
-    (loop repeat +execution-slot-bytes+ do (emit-u8 state 0))))
+    (loop repeat bytes do (emit-u8 state 0))))
 
 (defun emit-context-save (environment args)
   (require-bits environment 32 "CONTEXT-SAVE")
@@ -2188,7 +2735,13 @@
         (:phys-allocator-bootstrap
          (register-phys-allocator environment form))
         (:syscall-table
-         (register-syscall-table environment form))))))
+         (register-syscall-table environment form))
+        (:execution-slot-type
+         (register-slot-type environment form))
+        (:partition-table
+         (register-partition-table environment form))
+        (:volume
+         (register-volume environment form))))))
 
 (defun emit-keyboard-read (environment args)
   (require-bits environment 32 "KEYBOARD-READ")
@@ -2351,6 +2904,14 @@
          (emit-align state
                      (resolve-operand environment alignment)
                      (resolve-operand environment fill))))
+      (:pad-to
+       (destructuring-bind (_ offset &optional (fill 0)) form
+         (declare (ignore _))
+         (emit-pad-to state
+                      (resolve-operand environment offset)
+                      (resolve-operand environment fill))))
+      (:emit-helpers
+       (emit-required-helpers environment))
       (:fill
        (destructuring-bind (_ count &optional (fill-byte 0)) form
          (declare (ignore _))
@@ -2360,6 +2921,10 @@
        (destructuring-bind (_ bits) form
          (declare (ignore _))
          (set-assembly-bits state (resolve-operand environment bits))))
+      (:arch
+       (destructuring-bind (_ isa-name) form
+         (declare (ignore _))
+         (set-assembly-isa state (token-keyword isa-name))))
       (:gdt
        (emit-gdt environment form))
       (:idt
@@ -2524,6 +3089,20 @@
        (emit-block-read environment (rest form)))
       (:block-write
        (emit-block-write environment (rest form)))
+      (:partition-table
+       (emit-partition-table environment form))
+      (:partition-table-read
+       (emit-partition-table-read environment (rest form)))
+      (:partition-find
+       (emit-partition-find environment (rest form)))
+      (:volume
+       (emit-volume environment form))
+      (:volume-bind
+       (emit-volume-bind environment (rest form)))
+      (:volume-read
+       (emit-volume-read environment (rest form)))
+      (:volume-write
+       (emit-volume-write environment (rest form)))
       (:memory-map
        (emit-memory-map environment form))
       (:memory-map-probe
@@ -2540,6 +3119,8 @@
        (emit-phys-alloc environment (rest form)))
       (:phys-free
        (emit-phys-free environment (rest form)))
+      (:execution-slot-type
+       (emit-execution-slot-type environment form))
       (:execution-slot
        (emit-execution-slot environment form))
       (:context-save
@@ -2550,6 +3131,14 @@
        (emit-context-init environment (rest form)))
       (:syscall-table
        (emit-syscall-table environment form))
+      (:tss
+       (emit-tss environment form))
+      (:privilege-drop
+       (emit-privilege-drop environment (rest form)))
+      (:sysenter-setup
+       (emit-sysenter-setup environment (rest form)))
+      (:syscall-setup
+       (emit-syscall-setup environment (rest form)))
       (:load-section
        (destructuring-bind (_ section-name &rest args) form
          (declare (ignore _))
@@ -2579,7 +3168,10 @@
         :block-devices (make-hash-table :test 'eq)
         :memory-maps (make-hash-table :test 'eq)
         :phys-allocators (make-hash-table :test 'eq)
-        :syscall-tables (make-hash-table :test 'eq))))
+        :syscall-tables (make-hash-table :test 'eq)
+        :slot-types (make-hash-table :test 'eq)
+        :partition-tables (make-hash-table :test 'eq)
+        :volumes (make-hash-table :test 'eq))))
     (pre-scan-section environment (section-spec-body section))
     (dolist (form (section-spec-body section))
       (compile-form environment form))

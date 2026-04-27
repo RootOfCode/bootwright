@@ -22,6 +22,11 @@
     (error "Value ~S is not an unsigned 32-bit integer." value))
   value)
 
+(defun ensure-qword (value)
+  (unless (typep value '(integer 0 18446744073709551615))
+    (error "Value ~S is not an unsigned 64-bit integer." value))
+  value)
+
 (defun align-up (value alignment)
   (unless (and (plusp alignment) (integerp alignment))
     (error "Alignment must be a positive integer, got ~S." alignment))

@@ -1,0 +1,97 @@
+;;;; Bootwright ring-0 → ring-3 transition demo.
+;;;;
+;;;; Builds a GDT with kernel CS/DS, ring-3 user CS/DS, and a TSS.
+;;;; Loads an IDT with INT 0x80 callable from ring 3.
+;;;; Issues PRIVILEGE-DROP to enter ring 3, where user code immediately
+;;;; performs INT 0x80.  The CPU consults the TSS for ESP0/SS0, switches
+;;;; back to the kernel ring-0 stack, and the syscall handler logs success.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *userspace-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading userspace demo
+")
+      (bios-print "Bootwright stage 1: loading userspace demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const ring0-stack-top  #x90000)
+    (const ring3-stack-top  #x80000)
+    (string banner-pmode  "Stage 1 ok. Entering protected mode...")
+    (string label-step1   "Drop to ring 3 :")
+    (string label-step2   "INT 0x80 ring 3:")
+    (string label-status  "Userspace ring :")
+    (string label-help    "GDT user CS/DS + TSS + IRET privilege drop.")
+    (string status-ok     "OK")
+    (string status-pass   "PASS")
+    (string debug-ready   "kernel: userspace demo reached
+")
+    (string debug-drop    "kernel: dropping to ring 3
+")
+    (string debug-syscall "kernel: int 0x80 from ring 3 received
+")
+    (string debug-pass    "kernel: userspace demo passed
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF)
+      (:code32 :base :section :limit #xAFFFF :dpl 3)
+      (:data32 :base :section :limit #xAFFFF :dpl 3)
+      (:tss :label kernel-tss))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry user-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine user-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear ring0-stack-top)
+      (irq-remap :master-mask #xFF :slave-mask #xFF)
+      (load-idt idt-descriptor)
+      (load-tr #x28)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 9
+                                :attribute #x1E
+                                :title "Bootwright userspace demo")
+      (framebuffer-print-at screen0 label-step1  :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-step2  :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-status :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help   :row 7 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+      (framebuffer-print-at screen0 status-ok :row 2 :column 22 :attribute #x2F)
+      (debug-print debug-drop)
+      (privilege-drop :data-selector #x23
+                      :code-selector #x1B
+                      :stack-linear ring3-stack-top
+                      :entry-point user-entry))
+    (routine user-entry
+      (mov eax 0)
+      (int #x80)
+      (jmp user-entry))
+    (routine sys-vec0
+      (debug-print debug-syscall)
+      (framebuffer-print-at screen0 status-ok   :row 3 :column 22 :attribute #x2F)
+      (framebuffer-print-at screen0 status-pass :row 5 :column 22 :attribute #x2F)
+      (debug-print debug-pass)
+      (idle-forever))
+    (routine default-interrupt
+      (debug-print "kernel: unexpected interrupt
+")
+      (hang))
+    (idt idt (:pointer idt-descriptor :selector #x08 :default default-interrupt)
+      (:entry #x80 syscalls-handler :dpl 3))
+    (syscall-table syscalls
+      (:entry 0 sys-vec0))
+    (tss kernel-tss (:ring0-stack-linear ring0-stack-top
+                     :ring0-stack-selector #x10))))

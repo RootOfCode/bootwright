@@ -20,7 +20,10 @@
                     ("examples/cpu/demo-memops.bwo"          "out/cpu/bootwright-memops.img")
                     ("examples/cpu/demo-sysinstr.bwo"        "out/cpu/bootwright-sysinstr.img")
                     ("examples/exec/demo-context.bwo"        "out/exec/bootwright-context.img")
-                    ("examples/exec/demo-syscalls.bwo"       "out/exec/bootwright-syscalls.img")))
+                    ("examples/exec/demo-syscalls.bwo"       "out/exec/bootwright-syscalls.img")
+                    ("examples/exec/demo-userspace.bwo"      "out/exec/bootwright-userspace.img")
+                    ("examples/exec/demo-sysenter.bwo"       "out/exec/bootwright-sysenter.img")
+                    ("examples/devices/demo-storage.bwo"     "out/devices/bootwright-storage.img")))
       (destructuring-bind (source output) spec
         (let ((pathname (funcall builder
                                  (merge-pathnames source root)

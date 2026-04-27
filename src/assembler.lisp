@@ -1,5 +1,54 @@
 (in-package #:bootwright)
 
+;;;; ISA backend abstraction
+;;;;
+;;;; An ISA descriptor packages everything the section compiler needs to know
+;;;; about a target instruction set:
+;;;;   * NAME            keyword identifier (:x86-32 :x86-64 :aarch64 ...)
+;;;;   * ADDRESS-BITS    16, 32, 64
+;;;;   * ENDIANNESS      :little :big
+;;;;   * ENCODE-FN       (state operator operands) -> nil
+;;;;   * FIXUP-FN        (state buffer fixup labels) -> nil  (NIL = use shared resolver)
+;;;;   * NOP-SEQUENCE    octet vector for alignment padding
+;;;;   * POINTER-WIDTH   bytes per pointer
+;;;;   * STACK-ALIGNMENT bytes; required at function boundaries
+;;;;   * REGISTER-FILE   alist of (keyword . register-descriptor)
+;;;;
+;;;; Backends register themselves at load time so the section compiler can
+;;;; dispatch through the descriptor without hardcoding ISA names.
+
+(defstruct (isa-descriptor
+            (:constructor make-isa-descriptor
+                (&key name address-bits endianness encode-fn fixup-fn
+                      nop-sequence pointer-width stack-alignment register-file)))
+  name
+  address-bits
+  endianness
+  encode-fn
+  fixup-fn
+  (nop-sequence #(#x90))
+  pointer-width
+  stack-alignment
+  register-file)
+
+(defvar *isa-backends* (make-hash-table :test 'eq))
+
+(defun register-isa-backend (descriptor)
+  (let ((name (isa-descriptor-name descriptor)))
+    (unless (keywordp name)
+      (error "ISA backend name must be a keyword, got ~S." name))
+    (setf (gethash name *isa-backends*) descriptor)
+    descriptor))
+
+(defun find-isa-backend (name)
+  (or (gethash name *isa-backends*)
+      (error "Unknown ISA backend ~S." name)))
+
+(defun all-isa-backends ()
+  (let ((acc nil))
+    (maphash (lambda (k v) (declare (ignore k)) (push v acc)) *isa-backends*)
+    acc))
+
 (defparameter +x86-byte-registers+
   '(("AL" . 0) ("CL" . 1) ("DL" . 2) ("BL" . 3)
     ("AH" . 4) ("CH" . 5) ("DH" . 6) ("BH" . 7)))
@@ -19,6 +68,12 @@
 (defparameter +x86-control-registers+
   '(("CR0" . 0) ("CR2" . 2) ("CR3" . 3) ("CR4" . 4)))
 
+(defparameter +x86-qword-registers+
+  '(("RAX" . 0)  ("RCX" . 1)  ("RDX" . 2)  ("RBX" . 3)
+    ("RSP" . 4)  ("RBP" . 5)  ("RSI" . 6)  ("RDI" . 7)
+    ("R8"  . 8)  ("R9"  . 9)  ("R10" . 10) ("R11" . 11)
+    ("R12" . 12) ("R13" . 13) ("R14" . 14) ("R15" . 15)))
+
 (defstruct (fixup (:constructor make-fixup (&key kind position target (addend 0))))
   kind
   position
@@ -27,21 +82,32 @@
 
 (defstruct (assembly-state
             (:constructor %make-assembly-state
-                (&key origin linear-base default-bits bytes labels fixups)))
+                (&key origin linear-base default-bits isa-name bytes labels fixups)))
   origin
   linear-base
   default-bits
+  isa-name
   bytes
   labels
   fixups)
 
-(defun make-assembly-state (&key (origin 0) (linear-base origin) (bits 16))
-  (%make-assembly-state :origin origin
-                        :linear-base linear-base
-                        :default-bits bits
-                        :bytes (make-octet-buffer)
-                        :labels (make-hash-table :test 'equal)
-                        :fixups '()))
+(defun bits-to-isa-name (bits)
+  (ecase bits
+    (16 :x86-16)
+    (32 :x86-32)
+    (64 :x86-64)))
+
+(defun make-assembly-state (&key (origin 0) (linear-base origin) (bits 16) isa)
+  (let* ((isa-name (or isa (bits-to-isa-name bits)))
+         (descriptor (find-isa-backend isa-name))
+         (bits (isa-descriptor-address-bits descriptor)))
+    (%make-assembly-state :origin origin
+                          :linear-base linear-base
+                          :default-bits bits
+                          :isa-name isa-name
+                          :bytes (make-octet-buffer)
+                          :labels (make-hash-table :test 'equal)
+                          :fixups '())))
 
 (defun assembly-offset (state)
   (length (assembly-state-bytes state)))
@@ -55,11 +121,17 @@
 (defun assembly-bits (state)
   (assembly-state-default-bits state))
 
+(defun assembly-isa (state)
+  (find-isa-backend (assembly-state-isa-name state)))
+
+(defun set-assembly-isa (state isa-name)
+  (let ((descriptor (find-isa-backend isa-name)))
+    (setf (assembly-state-isa-name state) isa-name
+          (assembly-state-default-bits state) (isa-descriptor-address-bits descriptor))
+    state))
+
 (defun set-assembly-bits (state bits)
-  (unless (member bits '(16 32))
-    (error "Bootwright only supports 16-bit and 32-bit code generation, got ~S." bits))
-  (setf (assembly-state-default-bits state) bits)
-  state)
+  (set-assembly-isa state (bits-to-isa-name bits)))
 
 (defun emit-u8 (state value)
   (append-octet (assembly-state-bytes state) value))
@@ -75,6 +147,16 @@
     (emit-u8 state (ldb (byte 8 8) dword))
     (emit-u8 state (ldb (byte 8 16) dword))
     (emit-u8 state (ldb (byte 8 24) dword))))
+
+(defun emit-u64 (state value)
+  (let ((qword (ensure-qword value)))
+    (dotimes (i 8)
+      (emit-u8 state (ldb (byte 8 (* i 8)) qword)))))
+
+(defun patch-u64 (buffer position value)
+  (let ((qword (ensure-qword value)))
+    (dotimes (i 8)
+      (setf (aref buffer (+ position i)) (ldb (byte 8 (* i 8)) qword)))))
 
 (defun patch-u8 (buffer position value)
   (setf (aref buffer position) (ensure-octet value)))
@@ -107,6 +189,9 @@
 (defun dword-register-p (operand)
   (register-code operand +x86-dword-registers+))
 
+(defun qword-register-p (operand)
+  (register-code operand +x86-qword-registers+))
+
 (defun segment-register-p (operand)
   (register-code operand +x86-segment-registers+))
 
@@ -117,6 +202,7 @@
   (or (byte-register-p operand)
       (word-register-p operand)
       (dword-register-p operand)
+      (qword-register-p operand)
       (segment-register-p operand)
       (control-register-p operand)))
 
@@ -152,6 +238,36 @@
     (unless parts
       (error "Memory operand ~S is missing an address." operand))
     (values width parts)))
+
+(defun rip-relative-memory-operand-p (operand)
+  "True for (:mem [:width] :rip displacement) — x86-64 RIP-relative addressing."
+  (when (memory-operand-p operand)
+    (multiple-value-bind (width parts) (parse-memory-operand operand)
+      (declare (ignore width))
+      (and (consp parts)
+           (typep (first parts) '(or symbol string))
+           (eq (token-keyword (first parts)) :rip)))))
+
+(defun rip-relative-displacement (operand)
+  "Return the displacement form from a (:mem :rip displacement) operand."
+  (multiple-value-bind (width parts) (parse-memory-operand operand)
+    (declare (ignore width))
+    (or (second parts) 0)))
+
+(defun emit-rip-relative-displacement (state operand)
+  "Emit the disp32 for a (:mem :rip X) operand. Integer X emits a literal
+displacement; symbol/label X emits a rel32 fixup so the linker resolves it
+against the address of the next instruction."
+  (let ((displacement (rip-relative-displacement operand)))
+    (cond ((integerp displacement)
+           (let ((value (ldb (byte 32 0) displacement)))
+             (emit-u32 state value)))
+          ((symbolp displacement)
+           (emit-rel32 state displacement))
+          ((label-reference-p displacement)
+           (emit-rel32 state (second displacement)))
+          (t
+           (error "Unsupported RIP-relative displacement ~S." displacement)))))
 
 (defun label-reference-p (operand)
   (and (consp operand)
@@ -225,9 +341,33 @@
         (assembly-state-fixups state)))
 
 (defun emit-operand-size-prefix (state width)
-  (when (and (/= width 8)
-             (/= width (assembly-bits state)))
-    (emit-u8 state #x66)))
+  ;; In x86-64 the default operand size is 32 bits; only 16-bit ops take 66h.
+  ;; In x86-16/x86-32 the existing rule applies: emit 66h when width differs
+  ;; from default-bits.
+  (cond ((= (assembly-bits state) 64)
+         (when (= width 16)
+           (emit-u8 state #x66)))
+        (t
+         (when (and (/= width 8)
+                    (/= width (assembly-bits state)))
+           (emit-u8 state #x66)))))
+
+(defun emit-rex (state &key w r x b)
+  "Emit a REX prefix byte (#x40 base) when any of W/R/X/B is non-NIL."
+  (when (or w r x b)
+    (emit-u8 state (logior #x40
+                           (if w #x8 0)
+                           (if r #x4 0)
+                           (if x #x2 0)
+                           (if b #x1 0)))))
+
+(defun rex-extension-bit (register-code)
+  "Return T if REGISTER-CODE >= 8 (needs REX extension) else NIL."
+  (and register-code (>= register-code 8)))
+
+(defun rex-low-bits (register-code)
+  "Return REGISTER-CODE masked to its low 3 bits (for the ModRM/SIB field)."
+  (logand register-code 7))
 
 (defun emit-imm8 (state operand)
   (let ((normalized (normalize-immediate operand))
@@ -276,6 +416,23 @@
            (add-fixup state :imm32-linear (second normalized) position (third normalized)))
           (t
            (error "Unsupported 32-bit immediate operand ~S." operand)))))
+
+(defun emit-imm64 (state operand)
+  (let ((normalized (normalize-immediate operand))
+        (position (assembly-offset state)))
+    (cond ((integerp normalized)
+           (emit-u64 state normalized))
+          ((label-reference-p normalized)
+           (emit-u64 state 0)
+           (add-fixup state :imm64 (second normalized) position))
+          ((linear-reference-p normalized)
+           (emit-u64 state 0)
+           (add-fixup state :imm64-linear (second normalized) position))
+          ((linear-addend-reference-p normalized)
+           (emit-u64 state 0)
+           (add-fixup state :imm64-linear (second normalized) position (third normalized)))
+          (t
+           (error "Unsupported 64-bit immediate operand ~S." operand)))))
 
 (defun emit-rel8 (state label)
   (let ((target (normalize-immediate label))
@@ -330,6 +487,16 @@
              (patch-u32 buffer position offset-target))
             (:imm32-linear
              (patch-u32 buffer position linear-target))
+            (:imm64
+             (patch-u64 buffer position offset-target))
+            (:imm64-linear
+             (patch-u64 buffer position linear-target))
+            (:linear-low16
+             (patch-u16 buffer position (ldb (byte 16 0) linear-target)))
+            (:linear-mid8
+             (patch-u8 buffer position (ldb (byte 8 16) linear-target)))
+            (:linear-high8
+             (patch-u8 buffer position (ldb (byte 8 24) linear-target)))
             (:rel8
              (let ((delta (- target-address (+ origin position 1))))
                (unless (typep delta '(integer -128 127))
@@ -683,6 +850,11 @@
                    source)))
 
 (defun encode-instruction (state operator operands)
+  "Dispatch instruction encoding through the assembly state's current ISA."
+  (let ((isa (assembly-isa state)))
+    (funcall (isa-descriptor-encode-fn isa) state operator operands)))
+
+(defun x86-encode-instruction (state operator operands)
   (flet ((expect-arity (count)
            (unless (= (length operands) count)
              (error "~S expects ~D operands, got ~D." operator count (length operands)))))
@@ -882,26 +1054,72 @@
                      (first operands)))))
       (:push
        (expect-arity 1)
-       (cond ((dword-register-p (first operands))
-              (emit-unary-register-op state #x50 (first operands) 32 +x86-dword-registers+))
-             ((word-register-p (first operands))
-              (emit-unary-register-op state #x50 (first operands) 16 +x86-word-registers+))
-             (t
-              (error "PUSH currently supports 16-bit and 32-bit registers, got ~S."
-                     (first operands)))))
+       (let ((operand (first operands)))
+         (cond ((qword-register-p operand)
+                (let ((code (qword-register-p operand)))
+                  (emit-rex state :b (rex-extension-bit code))
+                  (emit-u8 state (logior #x50 (rex-low-bits code)))))
+               ((dword-register-p operand)
+                (emit-unary-register-op state #x50 operand 32 +x86-dword-registers+))
+               ((word-register-p operand)
+                (emit-unary-register-op state #x50 operand 16 +x86-word-registers+))
+               ((let ((normalized (normalize-immediate operand)))
+                  (or (integerp normalized)
+                      (label-reference-p normalized)
+                      (linear-reference-p normalized)
+                      (linear-addend-reference-p normalized)))
+                (unless (member (assembly-bits state) '(32 64))
+                  (error "PUSH imm32 requires 32- or 64-bit assembly, got ~D-bit." (assembly-bits state)))
+                (emit-u8 state #x68)
+                (emit-imm32 state operand))
+               (t
+                (error "PUSH supports 16/32/64-bit registers or imm32, got ~S." operand)))))
       (:pop
        (expect-arity 1)
-       (cond ((dword-register-p (first operands))
-              (emit-unary-register-op state #x58 (first operands) 32 +x86-dword-registers+))
-             ((word-register-p (first operands))
-              (emit-unary-register-op state #x58 (first operands) 16 +x86-word-registers+))
-             (t
-              (error "POP currently supports 16-bit and 32-bit registers, got ~S."
-                     (first operands)))))
+       (let ((operand (first operands)))
+         (cond ((qword-register-p operand)
+                (let ((code (qword-register-p operand)))
+                  (emit-rex state :b (rex-extension-bit code))
+                  (emit-u8 state (logior #x58 (rex-low-bits code)))))
+               ((dword-register-p operand)
+                (emit-unary-register-op state #x58 operand 32 +x86-dword-registers+))
+               ((word-register-p operand)
+                (emit-unary-register-op state #x58 operand 16 +x86-word-registers+))
+               (t
+                (error "POP currently supports 16/32/64-bit registers, got ~S." operand)))))
       (:mov
        (expect-arity 2)
        (destructuring-bind (destination source) operands
-         (cond ((dword-register-p destination)
+         (cond ((qword-register-p destination)
+                (cond ((qword-register-p source)
+                       ;; REX.W [.R][.B] 89 /r
+                       (let ((dcode (qword-register-p destination))
+                             (scode (qword-register-p source)))
+                         (emit-rex state :w t
+                                         :r (rex-extension-bit scode)
+                                         :b (rex-extension-bit dcode))
+                         (emit-u8 state #x89)
+                         (emit-modrm state 3 (rex-low-bits scode) (rex-low-bits dcode))))
+                      ((rip-relative-memory-operand-p source)
+                       ;; REX.W [.R] 8B /r ModRM(mod=00,r/m=101) disp32
+                       (let ((dcode (qword-register-p destination)))
+                         (emit-rex state :w t :r (rex-extension-bit dcode))
+                         (emit-u8 state #x8B)
+                         (emit-modrm state 0 (rex-low-bits dcode) 5)
+                         (emit-rip-relative-displacement state source)))
+                      ((or (integerp source)
+                           (label-reference-p (normalize-immediate source))
+                           (linear-reference-p (normalize-immediate source))
+                           (linear-addend-reference-p (normalize-immediate source))
+                           (and (symbolp source) (not (register-symbol-p source))))
+                       ;; movabs: REX.W [.B] B8+rd imm64
+                       (let ((code (qword-register-p destination)))
+                         (emit-rex state :w t :b (rex-extension-bit code))
+                         (emit-u8 state (logior #xB8 (rex-low-bits code)))
+                         (emit-imm64 state source)))
+                      (t
+                       (error "Unsupported MOV qword destination operands ~S." operands))))
+               ((dword-register-p destination)
                 (cond ((dword-register-p source)
                        (emit-register-register state #x89 destination source
                                               +x86-dword-registers+ +x86-dword-registers+ 32))
@@ -1346,6 +1564,22 @@
        (expect-arity 0)
        (emit-u8 state #x0F)
        (emit-u8 state #x32))
+      (:sysenter
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x34))
+      (:sysexit
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x35))
+      (:syscall
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x05))
+      (:sysret
+       (expect-arity 0)
+       (emit-u8 state #x0F)
+       (emit-u8 state #x07))
       (:clts
        (expect-arity 0)
        (emit-u8 state #x0F)
@@ -1580,3 +1814,122 @@
        (emit-near-conditional-jump state #x8F (first operands)))
       (t
        (error "Unknown instruction ~S." operator)))))
+
+;;;; ----------------------------------------------------------------
+;;;; ISA backend registrations
+;;;;
+;;;; All three x86 modes share the same encoder body; the encoder
+;;;; branches on (assembly-bits state) for operand-size and addressing.
+;;;; The register-file slot is informational here; the encoder still
+;;;; reaches into +x86-{byte,word,dword,qword,...}-registers+ directly.
+;;;; ----------------------------------------------------------------
+
+(register-isa-backend
+ (make-isa-descriptor
+  :name :x86-16
+  :address-bits 16
+  :endianness :little
+  :encode-fn #'x86-encode-instruction
+  :nop-sequence #(#x90)
+  :pointer-width 2
+  :stack-alignment 2
+  :register-file +x86-word-registers+))
+
+(register-isa-backend
+ (make-isa-descriptor
+  :name :x86-32
+  :address-bits 32
+  :endianness :little
+  :encode-fn #'x86-encode-instruction
+  :nop-sequence #(#x90)
+  :pointer-width 4
+  :stack-alignment 4
+  :register-file +x86-dword-registers+))
+
+(register-isa-backend
+ (make-isa-descriptor
+  :name :x86-64
+  :address-bits 64
+  :endianness :little
+  :encode-fn #'x86-encode-instruction
+  :nop-sequence #(#x90)
+  :pointer-width 8
+  :stack-alignment 16
+  :register-file +x86-qword-registers+))
+
+;;;; ----------------------------------------------------------------
+;;;; AArch64 backend (stub)
+;;;;
+;;;; Minimal encoder validating the ISA abstraction across architectures.
+;;;; Currently supports NOP, RET [Xn], MOV Xd, #imm16 (MOVZ), BR Xn.
+;;;; Fixed-width 4-byte little-endian instructions.
+;;;; ----------------------------------------------------------------
+
+(defparameter +aarch64-x-registers+
+  '(("X0" . 0)   ("X1" . 1)   ("X2" . 2)   ("X3" . 3)
+    ("X4" . 4)   ("X5" . 5)   ("X6" . 6)   ("X7" . 7)
+    ("X8" . 8)   ("X9" . 9)   ("X10" . 10) ("X11" . 11)
+    ("X12" . 12) ("X13" . 13) ("X14" . 14) ("X15" . 15)
+    ("X16" . 16) ("X17" . 17) ("X18" . 18) ("X19" . 19)
+    ("X20" . 20) ("X21" . 21) ("X22" . 22) ("X23" . 23)
+    ("X24" . 24) ("X25" . 25) ("X26" . 26) ("X27" . 27)
+    ("X28" . 28) ("X29" . 29) ("X30" . 30) ("XZR" . 31) ("SP" . 31)))
+
+(defun aarch64-x-register-p (operand)
+  (register-code operand +aarch64-x-registers+))
+
+(defun emit-aarch64-instruction (state value)
+  "Emit a 4-byte little-endian AArch64 instruction word."
+  (emit-u8 state (ldb (byte 8 0) value))
+  (emit-u8 state (ldb (byte 8 8) value))
+  (emit-u8 state (ldb (byte 8 16) value))
+  (emit-u8 state (ldb (byte 8 24) value)))
+
+(defun aarch64-encode-instruction (state operator operands)
+  (case (token-keyword operator)
+    (:nop
+     (emit-aarch64-instruction state #xD503201F))
+    (:ret
+     (let ((reg (if operands
+                    (or (aarch64-x-register-p (first operands))
+                        (error "AArch64 RET expects an X register, got ~S." (first operands)))
+                    30)))
+       (emit-aarch64-instruction state (logior #xD65F0000 (ash reg 5)))))
+    (:br
+     (unless (= (length operands) 1)
+       (error "AArch64 BR expects 1 operand, got ~S." operands))
+     (let ((reg (or (aarch64-x-register-p (first operands))
+                    (error "AArch64 BR requires an X register, got ~S." (first operands)))))
+       (emit-aarch64-instruction state (logior #xD61F0000 (ash reg 5)))))
+    (:mov
+     (unless (= (length operands) 2)
+       (error "AArch64 MOV expects 2 operands, got ~S." operands))
+     (destructuring-bind (dst imm) operands
+       (let ((rd (or (aarch64-x-register-p dst)
+                     (error "AArch64 MOV destination must be an X register, got ~S." dst))))
+         (unless (typep imm '(integer 0 #xFFFF))
+           (error "AArch64 MOV immediate must fit in 16 bits, got ~S." imm))
+         (emit-aarch64-instruction state
+                                   (logior #xD2800000
+                                           (ash imm 5)
+                                           rd)))))
+    (:svc
+     (unless (= (length operands) 1)
+       (error "AArch64 SVC expects 1 immediate operand, got ~S." operands))
+     (let ((imm (first operands)))
+       (unless (typep imm '(integer 0 #xFFFF))
+         (error "AArch64 SVC immediate must fit in 16 bits, got ~S." imm))
+       (emit-aarch64-instruction state (logior #xD4000001 (ash imm 5)))))
+    (t
+     (error "AArch64 instruction ~S not implemented in stub backend." operator))))
+
+(register-isa-backend
+ (make-isa-descriptor
+  :name :aarch64
+  :address-bits 64
+  :endianness :little
+  :encode-fn #'aarch64-encode-instruction
+  :nop-sequence #(#x1F #x20 #x03 #xD5)
+  :pointer-width 8
+  :stack-alignment 16
+  :register-file +aarch64-x-registers+))

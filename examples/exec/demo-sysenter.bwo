@@ -1,0 +1,76 @@
+;;;; Bootwright SYSENTER fast-call demo.
+;;;;
+;;;; Programs IA32_SYSENTER_CS/ESP/EIP via SYSENTER-SETUP, then issues
+;;;; SYSENTER from ring 0.  The handler logs success and halts.
+;;;; Verifies the WRMSR + SYSENTER opcode encodings and that the CPU
+;;;; transitions to the configured handler with CS:SS = kernel-cs:(kernel-cs+8).
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *sysenter-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading sysenter demo
+")
+      (bios-print "Bootwright stage 1: loading sysenter demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (const sysenter-stack  #x88000)
+    (string banner-pmode    "Stage 1 ok. Entering protected mode...")
+    (string label-step1     "Program MSRs   :")
+    (string label-step2     "Issue SYSENTER :")
+    (string label-status    "Handler ran    :")
+    (string label-help      "WRMSR 0x174/0x175/0x176 then SYSENTER opcode.")
+    (string status-ok       "OK")
+    (string status-pass     "PASS")
+    (string debug-ready     "kernel: sysenter demo reached
+")
+    (string debug-program   "kernel: sysenter MSRs programmed
+")
+    (string debug-handler   "kernel: sysenter handler ran
+")
+    (string debug-pass      "kernel: sysenter demo passed
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry sysenter-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine sysenter-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 9
+                                :attribute #x1E
+                                :title "Bootwright sysenter demo")
+      (framebuffer-print-at screen0 label-step1  :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-step2  :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-status :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help   :row 7 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+      (sysenter-setup :kernel-cs #x08
+                      :kernel-stack sysenter-stack
+                      :handler-linear sysenter-handler)
+      (framebuffer-print-at screen0 status-ok :row 2 :column 22 :attribute #x2F)
+      (debug-print debug-program)
+      (sysenter))
+    (routine sysenter-handler
+      (debug-print debug-handler)
+      (framebuffer-print-at screen0 status-ok   :row 3 :column 22 :attribute #x2F)
+      (framebuffer-print-at screen0 status-pass :row 5 :column 22 :attribute #x2F)
+      (debug-print debug-pass)
+      (idle-forever))))

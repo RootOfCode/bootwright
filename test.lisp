@@ -5,6 +5,62 @@
        (asd (merge-pathnames #P"bootwright.asd" root)))
   (asdf:load-asd asd)
   (asdf:operate 'asdf:load-source-op :bootwright)
+  ;; Phase 1 byte-level encoder tests — exercise the ISA dispatch through
+  ;; assembly-state directly (no QEMU).  Each case asserts the exact octets
+  ;; emitted for an architecture/instruction pair.
+  (labels ((make-state (isa)
+             (funcall (symbol-function (find-symbol "MAKE-ASSEMBLY-STATE" "BOOTWRIGHT"))
+                      :isa isa))
+           (encode (state op operands)
+             (funcall (symbol-function (find-symbol "ENCODE-INSTRUCTION" "BOOTWRIGHT"))
+                      state op operands))
+           (state-bytes (state)
+             (funcall (symbol-function (find-symbol "ASSEMBLY-STATE-BYTES" "BOOTWRIGHT"))
+                      state))
+           (assert-bytes (state expected label)
+             (let ((actual (coerce (state-bytes state) 'list)))
+               (unless (equal actual expected)
+                 (error "Phase 1 ~A failed: expected ~S got ~S." label expected actual)))))
+    ;; x86-64
+    (let ((s (make-state :x86-64)))
+      (encode s 'mov '(rax rbx))
+      (assert-bytes s '(#x48 #x89 #xD8) "x86-64 MOV rax, rbx"))
+    (let ((s (make-state :x86-64)))
+      (encode s 'mov '(r8 r9))
+      (assert-bytes s '(#x4D #x89 #xC8) "x86-64 MOV r8, r9"))
+    (let ((s (make-state :x86-64)))
+      (encode s 'push '(rax))
+      (encode s 'pop '(r15))
+      (assert-bytes s '(#x50 #x41 #x5F) "x86-64 PUSH rax; POP r15"))
+    (let ((s (make-state :x86-64)))
+      (encode s 'mov '(rax #x1122334455667788))
+      (assert-bytes s '(#x48 #xB8 #x88 #x77 #x66 #x55 #x44 #x33 #x22 #x11)
+                    "x86-64 movabs rax, 0x1122334455667788"))
+    (let ((s (make-state :x86-64)))
+      (encode s 'mov '(rax (:mem :rip #x10)))
+      (assert-bytes s '(#x48 #x8B #x05 #x10 #x00 #x00 #x00) "x86-64 MOV rax, [rip+0x10]"))
+    (let ((s (make-state :x86-64)))
+      (encode s 'syscall '())
+      (encode s 'sysret '())
+      (encode s 'ret '())
+      (assert-bytes s '(#x0F #x05 #x0F #x07 #xC3) "x86-64 syscall; sysret; ret"))
+    ;; AArch64 stub
+    (let ((s (make-state :aarch64)))
+      (encode s 'nop '())
+      (assert-bytes s '(#x1F #x20 #x03 #xD5) "aarch64 NOP"))
+    (let ((s (make-state :aarch64)))
+      (encode s 'ret '())
+      (assert-bytes s '(#xC0 #x03 #x5F #xD6) "aarch64 RET"))
+    (let ((s (make-state :aarch64)))
+      (encode s 'mov '(x0 #x2A))
+      (assert-bytes s '(#x40 #x05 #x80 #xD2) "aarch64 MOV x0, #42"))
+    (let ((s (make-state :aarch64)))
+      (encode s 'br '(x30))
+      (assert-bytes s '(#xC0 #x03 #x1F #xD6) "aarch64 BR x30"))
+    (let ((s (make-state :aarch64)))
+      (encode s 'svc '(0))
+      (assert-bytes s '(#x01 #x00 #x00 #xD4) "aarch64 SVC #0"))
+    (format t "Bootwright Phase 1 byte-level tests passed.~%"))
   (labels ((test-source (source &rest args)
              (apply (symbol-function (find-symbol "TEST-OS-SOURCE-FILE" "BOOTWRIGHT"))
                     (merge-pathnames source root)
@@ -80,4 +136,26 @@
                                     "syscall: vec 1"
                                     "syscall: vec 2"
                                     "kernel: syscall table ok"))
+    (test-source "examples/exec/demo-userspace.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading userspace demo"
+                                    "kernel: userspace demo reached"
+                                    "kernel: dropping to ring 3"
+                                    "kernel: int 0x80 from ring 3 received"
+                                    "kernel: userspace demo passed"))
+    (test-source "examples/exec/demo-sysenter.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading sysenter demo"
+                                    "kernel: sysenter demo reached"
+                                    "kernel: sysenter MSRs programmed"
+                                    "kernel: sysenter handler ran"
+                                    "kernel: sysenter demo passed"))
+    (test-source "examples/devices/demo-storage.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("kernel: storage demo reached"
+                                    "kernel: partition-table-read ok"
+                                    "kernel: partition-find type 0x83 ok"
+                                    "kernel: volume bound to partition 0"
+                                    "kernel: volume-read sentinel match"
+                                    "kernel: storage demo passed"))
     (format t "Bootwright QEMU tests passed.~%")))
