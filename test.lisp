@@ -60,4 +60,24 @@
                  :expect-debugcon '("stage1: loading memmap demo"
                                     "kernel: memmap demo reached"
                                     "kernel: e820 ok"))
+    (test-source "examples/devices/demo-physalloc.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading physalloc demo"
+                                    "kernel: physalloc demo reached"
+                                    "kernel: phys-allocator ok"))
+    (test-source "examples/exec/demo-context.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading context demo"
+                                    "kernel: context demo reached"
+                                    "kernel: step B (running in thread-b)"
+                                    "kernel: step C (resumed in thread-a)"
+                                    "kernel: context-switch ok"))
+    (test-source "examples/exec/demo-syscalls.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading syscalls demo"
+                                    "kernel: syscalls demo reached"
+                                    "syscall: vec 0"
+                                    "syscall: vec 1"
+                                    "syscall: vec 2"
+                                    "kernel: syscall table ok"))
     (format t "Bootwright QEMU tests passed.~%")))

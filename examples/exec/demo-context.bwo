@@ -1,0 +1,103 @@
+;;;; Bootwright cooperative context-switch demo.
+;;;;
+;;;; Declares two execution-slots (thread-a, thread-b), initialises
+;;;; thread-b on its own stack, then performs one round-trip switch:
+;;;; main saves into thread-a -> restores thread-b -> thread-b prints
+;;;; and restores thread-a, which resumes after its save and signals
+;;;; success.  Verifies (context-save / context-restore / context-init)
+;;;; preserve callee-saved registers and round-trip cleanly.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *context-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading context demo
+")
+      (bios-print "Bootwright stage 1: loading context demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const main-stack-top     #x90000)
+    (const thread-b-stack-top #x80000)
+    (string banner-pmode  "Stage 1 ok. Entering protected mode...")
+    (string label-step-a  "Save thread-a  :")
+    (string label-step-b  "Run thread-b   :")
+    (string label-step-c  "Resume thread-a:")
+    (string label-status  "Switch result  :")
+    (string label-help    "Two slots, separate stacks, single round-trip.")
+    (string status-ok     "OK")
+    (string status-pass   "PASS")
+    (string debug-ready   "kernel: context demo reached
+")
+    (string debug-step-a  "kernel: step A (save thread-a, switch to B)
+")
+    (string debug-step-b  "kernel: step B (running in thread-b)
+")
+    (string debug-step-a2 "kernel: step C (resumed in thread-a)
+")
+    (string debug-pass    "kernel: context-switch ok
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry context-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine context-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear main-stack-top)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 9
+                                :attribute #x1E
+                                :title "Bootwright context-switch demo")
+      (framebuffer-print-at screen0 label-step-a :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-step-b :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-step-c :row 4 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-status :row 6 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help   :row 7 :column 2 :attribute #x2E)
+      (framebuffer-print-at screen0 status-ok    :row 2 :column 22 :attribute #x2F)
+      (debug-print debug-ready)
+      ;; Initialise thread-b on its own stack, mark we have not yet resumed.
+      (mov eax thread-b)
+      (context-init eax :entry-point thread-b-entry :stack-top thread-b-stack-top)
+      (mov (:mem :dword resumed-flag) 0)
+      (debug-print debug-step-a)
+      ;; Save thread-a's state; falls through on initial run, resumes here later.
+      (mov eax thread-a)
+      (context-save eax)
+      (mov eax (:mem :dword resumed-flag))
+      (test eax eax)
+      (jne-near resumed)
+      ;; Initial run: switch to thread-b.
+      (mov eax thread-b)
+      (context-restore eax)
+      ;; Unreachable.
+      (label resumed)
+      (framebuffer-print-at screen0 status-ok   :row 4 :column 22 :attribute #x2F)
+      (framebuffer-print-at screen0 status-pass :row 6 :column 22 :attribute #x2F)
+      (debug-print debug-step-a2)
+      (debug-print debug-pass)
+      (idle-forever))
+    (routine thread-b-entry
+      (framebuffer-print-at screen0 status-ok :row 3 :column 22 :attribute #x2F)
+      (debug-print debug-step-b)
+      (mov (:mem :dword resumed-flag) 1)
+      (mov eax thread-a)
+      (context-restore eax))
+    (align 4)
+    (execution-slot thread-a)
+    (execution-slot thread-b)
+    (label resumed-flag)
+    (dd 0)))

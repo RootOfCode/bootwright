@@ -14,10 +14,13 @@
                     ("examples/devices/demo-keyboard.bwo"    "out/devices/bootwright-keyboard.img")
                     ("examples/devices/demo-ata.bwo"         "out/devices/bootwright-ata.img")
                     ("examples/devices/demo-memmap.bwo"      "out/devices/bootwright-memmap.img")
+                    ("examples/devices/demo-physalloc.bwo"   "out/devices/bootwright-physalloc.img")
                     ("examples/cpu/demo-cpuinfo.bwo"         "out/cpu/bootwright-cpuinfo.img")
                     ("examples/cpu/demo-bench.bwo"           "out/cpu/bootwright-bench.img")
                     ("examples/cpu/demo-memops.bwo"          "out/cpu/bootwright-memops.img")
-                    ("examples/cpu/demo-sysinstr.bwo"        "out/cpu/bootwright-sysinstr.img")))
+                    ("examples/cpu/demo-sysinstr.bwo"        "out/cpu/bootwright-sysinstr.img")
+                    ("examples/exec/demo-context.bwo"        "out/exec/bootwright-context.img")
+                    ("examples/exec/demo-syscalls.bwo"       "out/exec/bootwright-syscalls.img")))
       (destructuring-bind (source output) spec
         (let ((pathname (funcall builder
                                  (merge-pathnames source root)

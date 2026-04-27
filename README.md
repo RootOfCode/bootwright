@@ -48,6 +48,9 @@ The included examples are:
 - [demo-keyboard.bwo](examples/devices/demo-keyboard.bwo) — interactive PS/2 keyboard echo: declares a `keyboard-driver`, wires IRQ1, blocks on `keyboard-read`, then mirrors each pressed key to a VGA cell and to debugcon. Run in a QEMU window and type.
 - [demo-ata.bwo](examples/devices/demo-ata.bwo) — declares a primary-bus ATA-PIO LBA28 `block-device`, reads sector 0 of the IDE companion disk, and verifies the `0xAA55` boot signature.
 - [demo-memmap.bwo](examples/devices/demo-memmap.bwo) — declares a `memory-map` backed by INT 15h E820, runs `memory-map-probe` in real mode before `enter-protected-mode`, then renders the entry count plus the first region's base/length/type on screen.
+- [demo-physalloc.bwo](examples/devices/demo-physalloc.bwo) — declares a `phys-allocator-bootstrap` (bitmap-backed page allocator), runs `phys-allocator-init`, allocates three pages, frees the middle, and re-allocates expecting it back.
+- [demo-context.bwo](examples/exec/demo-context.bwo) — cooperative context-switch with two `execution-slot`s: main saves into thread-a, restores thread-b, thread-b prints and restores thread-a, which resumes after its save and signals success.
+- [demo-syscalls.bwo](examples/exec/demo-syscalls.bwo) — declares a `syscall-table` with three entries, wires INT 0x80 to the dispatcher, and verifies each handler runs.
 
 ## DSL Features
 
@@ -79,6 +82,9 @@ Bootwright currently supports:
 - PS/2 keyboard support via `keyboard-driver` (declares ring buffer + scancode table + IRQ1 handler), `keyboard-read` (blocking), and `keyboard-poll` (non-blocking with `:empty` jump target). US-QWERTY scancode set 1; user wires the handler in their own IDT.
 - ATA-PIO LBA28 disk support via `block-device` (primary/secondary bus, 512-byte sectors), `block-read` (sector → buffer), and `block-write` (buffer → sector + cache flush). The bundled testing harness attaches every image as both floppy (boot) and IDE master (data), so `block-read` against the image's own sector 0 round-trips the boot signature.
 - BIOS E820 memory probing via `memory-map` (declares count + entry buffer), `memory-map-probe` (real-mode INT 15h fill), `memory-map-base` / `memory-map-count` (load entries pointer / count into a register).
+- Bitmap physical-page allocator via `phys-allocator-bootstrap` (declares bitmap + alloc/free helper routines), `phys-allocator-init` (zero bitmap), `phys-alloc` (one page → register), `phys-free` (release page).
+- Execution-context primitives via `execution-slot` (24-byte slot for callee-saved regs + saved EIP), `context-save` (stash EBX/ESI/EDI/EBP/ESP/EIP into slot), `context-restore` (load + indirect jmp), `context-init` (zero regs, set ESP/EIP for fresh dispatch).
+- `syscall-table` form: emits a PUSHAD-bracketed dispatcher (`<name>-handler`) that bound-checks EAX, indexes into the jump table, and IRETs. User wires the IDT gate manually.
 - Bootwright-native source loading/building through `load-os-source` and `build-os-source-file`.
 - Headless QEMU verification via `test-os` and `test-os-source-file`.
 - Multi-file source composition via `(include "other.bwo" ...)` — includes are resolved relative to the calling file and run in the same package, so a library file can define Lisp helpers that the main file splices into a `defos` body with `#.` (read-time eval).
@@ -95,6 +101,8 @@ The assembler supports:
 - `cpuid` for CPU identification and `rdtsc` for cycle counting.
 - CPL=0 system ops: `wrmsr`/`rdmsr`, `clts`, `ltr`, `invlpg`, `lret`/`retf`, `cmpxchg`, the `lock` prefix wrapper, and the `mfence`/`lfence`/`sfence` memory fences.
 - String I/O ops: `insb`/`insw`/`insd` and `outsb`/`outsw`/`outsd` (16/32-bit operand size selected by mode + prefix).
+- Variable shifts: `shl`/`shr` accept either an immediate count or `cl`.
+- Indirect control flow: `jmp` and `call` accept a 32-bit register or memory operand (`FF /4` / `FF /2`) in addition to the existing relative form.
 
 Memory operands follow Lisp syntax and can optionally declare width when needed:
 
@@ -128,6 +136,9 @@ That writes:
 - `out/devices/bootwright-keyboard.img`
 - `out/devices/bootwright-ata.img`
 - `out/devices/bootwright-memmap.img`
+- `out/devices/bootwright-physalloc.img`
+- `out/exec/bootwright-context.img`
+- `out/exec/bootwright-syscalls.img`
 
 You can also build a `.bwo` file directly from Lisp:
 
@@ -186,3 +197,6 @@ qemu-system-i386 \
 - `demo-keyboard.bwo` is interactive: it remaps the PIC to unmask IRQ1 only, hands off to a `keyboard-driver`-emitted scancode handler, and runs `keyboard-read` in a tight loop that echoes each typed character to row 2 column 22 and to debugcon. Verified under QEMU by sending `sendkey a b c ret` through the monitor pipe.
 - `demo-ata.bwo` issues a one-sector ATA-PIO read of LBA 0 (boot sector of the IDE companion disk attached by `testing.lisp`), then validates that the word at offset 510 of the 512-byte buffer equals `0xAA55`.
 - `demo-memmap.bwo` runs `memory-map-probe` (INT 15h E820) in the kernel's real-mode entry routine, before `enter-protected-mode`, then renders the entry count and first region in protected mode. Asserts that QEMU's BIOS returned at least one entry.
+- `demo-physalloc.bwo` allocates three pages, frees the middle one, and re-allocates — asserting that the bitmap allocator returns the freed page back. Demonstrates `phys-allocator-bootstrap` + `init`/`alloc`/`free`.
+- `demo-context.bwo` cooperatively switches between two `execution-slot`s on separate stacks: main saves itself, jumps to thread-b's entry, thread-b prints and jumps back, main resumes after its save and signals success.
+- `demo-syscalls.bwo` declares a `syscall-table` with three entries, wires INT 0x80 in the IDT to `syscalls-handler`, then issues three INT 0x80 calls and verifies each handler ran.

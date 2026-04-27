@@ -1,0 +1,87 @@
+;;;; Bootwright bootstrap physical-page allocator demo.
+;;;;
+;;;; Declares an in-section bitmap allocator, runs the bitmap zero init,
+;;;; allocates three pages (expecting 0, 0x1000, 0x2000), frees the
+;;;; middle page, and re-allocates expecting it back at 0x1000.  All
+;;;; checks branch to the fail label if any address mismatches; the demo
+;;;; debugcons "kernel: phys-allocator ok" only when every step passed.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *physalloc-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading physalloc demo
+")
+      (bios-print "Bootwright stage 1: loading physalloc demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode "Stage 1 ok. Entering protected mode...")
+    (string label-status "Allocator status:")
+    (string label-help   "Bitmap allocator: alloc x3, free middle, alloc x1.")
+    (string status-ok    "PASS")
+    (string status-fail  "FAIL")
+    (string debug-ready  "kernel: physalloc demo reached
+")
+    (string debug-pass   "kernel: phys-allocator ok
+")
+    (string debug-fail   "kernel: phys-allocator mismatch
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry physalloc-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine physalloc-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 60 :height 7
+                                :attribute #x1E
+                                :title "Bootwright phys-allocator demo")
+      (framebuffer-print-at screen0 label-status :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help   :row 5 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+      ;; Init bitmap to all-free.
+      (phys-allocator-init alloc)
+      ;; Allocate three pages — expect 0, 0x1000, 0x2000.
+      (phys-alloc alloc eax)
+      (cmp eax 0)
+      (jne-near pa-fail)
+      (phys-alloc alloc eax)
+      (cmp eax #x1000)
+      (jne-near pa-fail)
+      (phys-alloc alloc eax)
+      (cmp eax #x2000)
+      (jne-near pa-fail)
+      ;; Free the middle page.
+      (mov ebp #x1000)
+      (phys-free alloc ebp)
+      ;; Re-allocate — expect the freed page back.
+      (phys-alloc alloc eax)
+      (cmp eax #x1000)
+      (jne-near pa-fail)
+      (framebuffer-print-at screen0 status-ok :row 2 :column 22 :attribute #x2F)
+      (debug-print debug-pass)
+      (idle-forever)
+      (label pa-fail)
+      (framebuffer-print-at screen0 status-fail :row 2 :column 22 :attribute #x4F)
+      (debug-print debug-fail)
+      (hang))
+    (phys-allocator-bootstrap alloc (:base-address 0
+                                     :page-size 4096
+                                     :max-pages 4096))))

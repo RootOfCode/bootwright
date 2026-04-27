@@ -581,29 +581,44 @@
 
 (defun emit-shift-by-immediate (state opcode-ext operands)
   (destructuring-bind (operand count) operands
-    (let ((normalized-count (cond ((integerp count) count)
-                                  (t (error "Shift count must be an immediate integer, got ~S." count)))))
-      (unless (typep normalized-count '(integer 0 255))
-        (error "Shift count must fit in 8 bits, got ~S." count))
-      (let ((width (or (operand-width operand)
-                       (memory-operand-width operand)
-                       (error "Shift requires a register or explicitly-sized memory operand, got ~S."
-                              operand))))
-        (ecase width
-          (8
-           (emit-u8 state #xC0)
-           (emit-modrm-r/m state opcode-ext operand)
-           (emit-u8 state normalized-count))
-          (16
-           (emit-operand-size-prefix state 16)
-           (emit-u8 state #xC1)
-           (emit-modrm-r/m state opcode-ext operand)
-           (emit-u8 state normalized-count))
-          (32
-           (emit-operand-size-prefix state 32)
-           (emit-u8 state #xC1)
-           (emit-modrm-r/m state opcode-ext operand)
-           (emit-u8 state normalized-count)))))))
+    (let ((width (or (operand-width operand)
+                     (memory-operand-width operand)
+                     (error "Shift requires a register or explicitly-sized memory operand, got ~S."
+                            operand))))
+      (cond ((integerp count)
+             (unless (typep count '(integer 0 255))
+               (error "Shift count must fit in 8 bits, got ~S." count))
+             (ecase width
+               (8
+                (emit-u8 state #xC0)
+                (emit-modrm-r/m state opcode-ext operand)
+                (emit-u8 state count))
+               (16
+                (emit-operand-size-prefix state 16)
+                (emit-u8 state #xC1)
+                (emit-modrm-r/m state opcode-ext operand)
+                (emit-u8 state count))
+               (32
+                (emit-operand-size-prefix state 32)
+                (emit-u8 state #xC1)
+                (emit-modrm-r/m state opcode-ext operand)
+                (emit-u8 state count))))
+            ((and (typep count '(or symbol string))
+                  (eql (token-keyword count) :CL))
+             (ecase width
+               (8
+                (emit-u8 state #xD2)
+                (emit-modrm-r/m state opcode-ext operand))
+               (16
+                (emit-operand-size-prefix state 16)
+                (emit-u8 state #xD3)
+                (emit-modrm-r/m state opcode-ext operand))
+               (32
+                (emit-operand-size-prefix state 32)
+                (emit-u8 state #xD3)
+                (emit-modrm-r/m state opcode-ext operand))))
+            (t
+             (error "Shift count must be an immediate integer or CL, got ~S." count))))))
 
 (defun emit-conditional-jump (state opcode label)
   (emit-u8 state opcode)
@@ -748,16 +763,32 @@
                          operands))))))
       (:call
        (expect-arity 1)
-       (emit-u8 state #xE8)
-       (if (= (assembly-bits state) 16)
-           (emit-rel16 state (first operands))
-           (emit-rel32 state (first operands))))
+       (let ((operand (first operands)))
+         (cond ((dword-register-p operand)
+                (emit-u8 state #xFF)
+                (emit-modrm state 3 2 (dword-register-p operand)))
+               ((memory-operand-p operand)
+                (emit-u8 state #xFF)
+                (emit-modrm-r/m state 2 operand))
+               (t
+                (emit-u8 state #xE8)
+                (if (= (assembly-bits state) 16)
+                    (emit-rel16 state operand)
+                    (emit-rel32 state operand))))))
       (:jmp
        (expect-arity 1)
-       (emit-u8 state #xE9)
-       (if (= (assembly-bits state) 16)
-           (emit-rel16 state (first operands))
-           (emit-rel32 state (first operands))))
+       (let ((operand (first operands)))
+         (cond ((dword-register-p operand)
+                (emit-u8 state #xFF)
+                (emit-modrm state 3 4 (dword-register-p operand)))
+               ((memory-operand-p operand)
+                (emit-u8 state #xFF)
+                (emit-modrm-r/m state 4 operand))
+               (t
+                (emit-u8 state #xE9)
+                (if (= (assembly-bits state) 16)
+                    (emit-rel16 state operand)
+                    (emit-rel32 state operand))))))
       (:jz
        (expect-arity 1)
        (emit-u8 state #x74)

@@ -3,7 +3,7 @@
 (defstruct (compile-environment
             (:constructor make-compile-environment
                 (&key target section layouts state helpers constants keyboards
-                      block-devices memory-maps)))
+                      block-devices memory-maps phys-allocators syscall-tables)))
   target
   section
   layouts
@@ -12,7 +12,9 @@
   constants
   keyboards
   block-devices
-  memory-maps)
+  memory-maps
+  phys-allocators
+  syscall-tables)
 
 (defun helper-needed-p (environment helper)
   (gethash helper (compile-environment-helpers environment)))
@@ -1871,6 +1873,308 @@
          (state (compile-environment-state environment)))
     (encode-instruction state 'mov (list dest (list :MEM :DWORD (memory-map-descriptor-name mm))))))
 
+(defstruct (phys-allocator-descriptor
+            (:constructor make-phys-allocator-descriptor
+                (&key name base-address page-size max-pages
+                      bitmap-label alloc-helper free-helper)))
+  name base-address page-size max-pages
+  bitmap-label alloc-helper free-helper)
+
+(defun parse-phys-allocator-form (environment form)
+  (let* ((name (or (second form) (error "PHYS-ALLOCATOR-BOOTSTRAP requires a name.")))
+         (options (resolve-operands environment (third form)))
+         (base-address (or (getf options :base-address) 0))
+         (page-size (or (getf options :page-size) 4096))
+         (max-pages (or (getf options :max-pages) 4096)))
+    (unless (and (integerp base-address) (>= base-address 0))
+      (error "PHYS-ALLOCATOR-BOOTSTRAP :BASE-ADDRESS must be a non-negative integer, got ~S."
+             base-address))
+    (unless (and (integerp page-size)
+                 (plusp page-size)
+                 (zerop (logand page-size (1- page-size))))
+      (error "PHYS-ALLOCATOR-BOOTSTRAP :PAGE-SIZE must be a positive power of two, got ~S."
+             page-size))
+    (unless (and (integerp max-pages)
+                 (>= max-pages 8)
+                 (zerop (mod max-pages 8)))
+      (error "PHYS-ALLOCATOR-BOOTSTRAP :MAX-PAGES must be a positive multiple of 8, got ~S."
+             max-pages))
+    (let ((pkg (or (symbol-package name) *package*)))
+      (make-phys-allocator-descriptor
+       :name name
+       :base-address base-address
+       :page-size page-size
+       :max-pages max-pages
+       :bitmap-label  (intern (concatenate 'string (symbol-name name) "-BITMAP") pkg)
+       :alloc-helper  (intern (concatenate 'string (symbol-name name) "-ALLOC-HELPER") pkg)
+       :free-helper   (intern (concatenate 'string (symbol-name name) "-FREE-HELPER") pkg)))))
+
+(defun register-phys-allocator (environment form)
+  (let* ((alloc (parse-phys-allocator-form environment form))
+         (name (phys-allocator-descriptor-name alloc)))
+    (when (gethash name (compile-environment-phys-allocators environment))
+      (error "PHYS-ALLOCATOR-BOOTSTRAP ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-phys-allocators environment)) alloc)
+    alloc))
+
+(defun lookup-phys-allocator (environment name)
+  (or (gethash name (compile-environment-phys-allocators environment))
+      (error "Unknown phys-allocator ~S — is (phys-allocator-bootstrap ~S ...) declared in this section?"
+             name name)))
+
+(defun emit-phys-alloc-helper (environment alloc)
+  (let* ((state (compile-environment-state environment))
+         (bytes (truncate (phys-allocator-descriptor-max-pages alloc) 8))
+         (bitmap (phys-allocator-descriptor-bitmap-label alloc))
+         (page-shift (integer-length (1- (phys-allocator-descriptor-page-size alloc))))
+         (base-addr (phys-allocator-descriptor-base-address alloc))
+         (scan-loop (gensym "PA-SCAN-"))
+         (found-byte (gensym "PA-FOUND-"))
+         (bit-loop (gensym "PA-BITS-"))
+         (bit-found (gensym "PA-BIT-OK-"))
+         (alloc-fail (gensym "PA-FAIL-"))
+         (alloc-done (gensym "PA-DONE-")))
+    (emit-label state (phys-allocator-descriptor-alloc-helper alloc))
+    (encode-instruction state 'mov (list 'esi bitmap))
+    (encode-instruction state 'mov (list 'ecx bytes))
+    (emit-label state scan-loop)
+    (encode-instruction state 'test '(ecx ecx))
+    (encode-instruction state 'jz-near (list alloc-fail))
+    (encode-instruction state 'mov '(al (:mem :byte esi)))
+    (encode-instruction state 'cmp '(al #xFF))
+    (encode-instruction state 'jne-near (list found-byte))
+    (encode-instruction state 'inc '(esi))
+    (encode-instruction state 'dec '(ecx))
+    (encode-instruction state 'jmp (list scan-loop))
+    (emit-label state found-byte)
+    (encode-instruction state 'xor '(bl bl))   ; bit index
+    (encode-instruction state 'mov '(ah 1))    ; mask
+    (emit-label state bit-loop)
+    (encode-instruction state 'test '(al ah))
+    (encode-instruction state 'jz-near (list bit-found))
+    (encode-instruction state 'inc '(bl))
+    (encode-instruction state 'shl '(ah 1))
+    (encode-instruction state 'jmp (list bit-loop))
+    (emit-label state bit-found)
+    (encode-instruction state 'or '(al ah))
+    (encode-instruction state 'mov '((:mem :byte esi) al))
+    (encode-instruction state 'mov '(eax esi))
+    (encode-instruction state 'sub (list 'eax bitmap))
+    (encode-instruction state 'shl '(eax 3))
+    (encode-instruction state 'movzx '(ecx bl))
+    (encode-instruction state 'add '(eax ecx))
+    (encode-instruction state 'shl (list 'eax page-shift))
+    (when (plusp base-addr)
+      (encode-instruction state 'add (list 'eax base-addr)))
+    (encode-instruction state 'jmp (list alloc-done))
+    (emit-label state alloc-fail)
+    (encode-instruction state 'xor '(eax eax))
+    (emit-label state alloc-done)
+    (encode-instruction state 'ret '())))
+
+(defun emit-phys-free-helper (environment alloc)
+  (let* ((state (compile-environment-state environment))
+         (bitmap (phys-allocator-descriptor-bitmap-label alloc))
+         (page-shift (integer-length (1- (phys-allocator-descriptor-page-size alloc))))
+         (base-addr (phys-allocator-descriptor-base-address alloc)))
+    (emit-label state (phys-allocator-descriptor-free-helper alloc))
+    ;; EAX = address to free.
+    (when (plusp base-addr)
+      (encode-instruction state 'sub (list 'eax base-addr)))
+    (encode-instruction state 'shr (list 'eax page-shift))
+    ;; EAX = page index. Compute byte offset (EAX >> 3) and bit (EAX & 7).
+    (encode-instruction state 'mov '(ebx eax))
+    (encode-instruction state 'shr '(ebx 3))
+    (encode-instruction state 'and '(eax 7))
+    (encode-instruction state 'mov '(cl al))
+    (encode-instruction state 'mov '(al 1))
+    (encode-instruction state 'shl '(al cl))
+    (encode-instruction state 'not '(al))
+    ;; ESI = bitmap[byte-offset]
+    (encode-instruction state 'mov (list 'esi bitmap))
+    (encode-instruction state 'add '(esi ebx))
+    (encode-instruction state 'and '((:mem :byte esi) al))
+    (encode-instruction state 'ret '())))
+
+(defun emit-phys-allocator-bootstrap (environment form)
+  (require-bits environment 32 "PHYS-ALLOCATOR-BOOTSTRAP")
+  (let* ((state (compile-environment-state environment))
+         (name (second form))
+         (alloc (lookup-phys-allocator environment name))
+         (bytes (truncate (phys-allocator-descriptor-max-pages alloc) 8)))
+    (emit-align state 4)
+    (emit-label state name)
+    (emit-label state (phys-allocator-descriptor-bitmap-label alloc))
+    (loop repeat bytes do (emit-u8 state 0))
+    (emit-phys-alloc-helper environment alloc)
+    (emit-phys-free-helper environment alloc)))
+
+(defun emit-phys-allocator-init (environment args)
+  (require-bits environment 32 "PHYS-ALLOCATOR-INIT")
+  (let* ((name (or (first args) (error "PHYS-ALLOCATOR-INIT requires an allocator name.")))
+         (alloc (lookup-phys-allocator environment name))
+         (state (compile-environment-state environment))
+         (dwords (truncate (truncate (phys-allocator-descriptor-max-pages alloc) 8) 4)))
+    (encode-instruction state 'mov (list 'edi (phys-allocator-descriptor-bitmap-label alloc)))
+    (encode-instruction state 'mov (list 'ecx dwords))
+    (encode-instruction state 'xor '(eax eax))
+    (encode-instruction state 'cld '())
+    (encode-instruction state 'rep '(stosd))))
+
+(defun emit-phys-alloc (environment args)
+  (require-bits environment 32 "PHYS-ALLOC")
+  (let* ((name (or (first args) (error "PHYS-ALLOC requires an allocator name.")))
+         (dest (or (second args) (error "PHYS-ALLOC requires a destination register.")))
+         (alloc (lookup-phys-allocator environment name))
+         (state (compile-environment-state environment)))
+    (unless (dword-register-p dest)
+      (error "PHYS-ALLOC destination must be a 32-bit register, got ~S." dest))
+    (encode-instruction state 'call (list (phys-allocator-descriptor-alloc-helper alloc)))
+    (unless (eql (token-keyword dest) :EAX)
+      (encode-instruction state 'mov (list dest 'eax)))))
+
+(defun emit-phys-free (environment args)
+  (require-bits environment 32 "PHYS-FREE")
+  (let* ((name (or (first args) (error "PHYS-FREE requires an allocator name.")))
+         (src (or (second args) (error "PHYS-FREE requires a source register.")))
+         (alloc (lookup-phys-allocator environment name))
+         (state (compile-environment-state environment)))
+    (unless (dword-register-p src)
+      (error "PHYS-FREE source must be a 32-bit register, got ~S." src))
+    (unless (eql (token-keyword src) :EAX)
+      (encode-instruction state 'mov (list 'eax src)))
+    (encode-instruction state 'call (list (phys-allocator-descriptor-free-helper alloc)))))
+
+(defparameter +execution-slot-bytes+ 24)
+
+(defun emit-execution-slot (environment form)
+  (let* ((state (compile-environment-state environment))
+         (name (or (second form)
+                   (error "EXECUTION-SLOT requires a name."))))
+    (emit-align state 4)
+    (emit-label state name)
+    (loop repeat +execution-slot-bytes+ do (emit-u8 state 0))))
+
+(defun emit-context-save (environment args)
+  (require-bits environment 32 "CONTEXT-SAVE")
+  (let* ((slot-reg (or (first args)
+                       (error "CONTEXT-SAVE requires a slot pointer register.")))
+         (state (compile-environment-state environment))
+         (after-label (gensym "CTX-SAVE-")))
+    (unless (dword-register-p slot-reg)
+      (error "CONTEXT-SAVE requires a 32-bit register, got ~S." slot-reg))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 0) 'ebx))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 4) 'esi))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 8) 'edi))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 12) 'ebp))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 16) 'esp))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 20) after-label))
+    (emit-label state after-label)))
+
+(defun emit-context-restore (environment args)
+  (require-bits environment 32 "CONTEXT-RESTORE")
+  (let* ((slot-reg (or (first args)
+                       (error "CONTEXT-RESTORE requires a slot pointer register.")))
+         (state (compile-environment-state environment)))
+    (unless (dword-register-p slot-reg)
+      (error "CONTEXT-RESTORE requires a 32-bit register, got ~S." slot-reg))
+    (encode-instruction state 'mov (list 'ebx (list :MEM :DWORD slot-reg 0)))
+    (encode-instruction state 'mov (list 'esi (list :MEM :DWORD slot-reg 4)))
+    (encode-instruction state 'mov (list 'edi (list :MEM :DWORD slot-reg 8)))
+    (encode-instruction state 'mov (list 'ebp (list :MEM :DWORD slot-reg 12)))
+    (encode-instruction state 'mov (list 'esp (list :MEM :DWORD slot-reg 16)))
+    (encode-instruction state 'jmp (list (list :MEM :DWORD slot-reg 20)))))
+
+(defun emit-context-init (environment args)
+  (require-bits environment 32 "CONTEXT-INIT")
+  (let* ((slot-reg (or (first args)
+                       (error "CONTEXT-INIT requires a slot pointer register.")))
+         (rest-args (resolve-operands environment (rest args)))
+         (entry-point (or (getf rest-args :entry-point)
+                          (error "CONTEXT-INIT requires :ENTRY-POINT.")))
+         (stack-top (or (getf rest-args :stack-top)
+                        (error "CONTEXT-INIT requires :STACK-TOP.")))
+         (state (compile-environment-state environment)))
+    (unless (dword-register-p slot-reg)
+      (error "CONTEXT-INIT requires a 32-bit register, got ~S." slot-reg))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 0) 0))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 4) 0))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 8) 0))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 12) 0))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 16) stack-top))
+    (encode-instruction state 'mov (list (list :MEM :DWORD slot-reg 20) entry-point))))
+
+(defstruct (syscall-table-descriptor
+            (:constructor make-syscall-table-descriptor
+                (&key name handler-label table-label entries count)))
+  name handler-label table-label entries count)
+
+(defun parse-syscall-table-form (environment form)
+  (let* ((name (or (second form) (error "SYSCALL-TABLE requires a name.")))
+         (entries (cddr form))
+         (parsed (loop for entry in entries
+                       collect (destructuring-bind (kind vector target) entry
+                                 (unless (eq (token-keyword kind) :entry)
+                                   (error "SYSCALL-TABLE entry kind must be :ENTRY, got ~S." kind))
+                                 (let ((vec (resolve-operand environment vector)))
+                                   (unless (and (integerp vec) (>= vec 0) (<= vec 255))
+                                     (error "SYSCALL-TABLE :ENTRY vector must be 0..255, got ~S." vec))
+                                   (cons vec (resolve-operand environment target))))))
+         (max-vec (reduce #'max (mapcar #'car parsed) :initial-value -1))
+         (count (1+ max-vec))
+         (pkg (or (symbol-package name) *package*)))
+    (when (zerop count)
+      (error "SYSCALL-TABLE ~S requires at least one :ENTRY." name))
+    (make-syscall-table-descriptor
+     :name name
+     :handler-label (intern (concatenate 'string (symbol-name name) "-HANDLER") pkg)
+     :table-label   (intern (concatenate 'string (symbol-name name) "-TABLE") pkg)
+     :entries parsed
+     :count count)))
+
+(defun register-syscall-table (environment form)
+  (let* ((st (parse-syscall-table-form environment form))
+         (name (syscall-table-descriptor-name st)))
+    (when (gethash name (compile-environment-syscall-tables environment))
+      (error "SYSCALL-TABLE ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-syscall-tables environment)) st)
+    st))
+
+(defun lookup-syscall-table (environment name)
+  (or (gethash name (compile-environment-syscall-tables environment))
+      (error "Unknown syscall-table ~S — is (syscall-table ~S ...) declared in this section?"
+             name name)))
+
+(defun emit-syscall-table (environment form)
+  (require-bits environment 32 "SYSCALL-TABLE")
+  (let* ((state (compile-environment-state environment))
+         (name (second form))
+         (st (lookup-syscall-table environment name))
+         (handler (syscall-table-descriptor-handler-label st))
+         (table (syscall-table-descriptor-table-label st))
+         (count (syscall-table-descriptor-count st))
+         (bad-label (gensym "SYS-BAD-")))
+    (emit-label state name)
+    (emit-label state handler)
+    (encode-instruction state 'pushad '())
+    (encode-instruction state 'cmp (list 'eax count))
+    (encode-instruction state 'jae-near (list bad-label))
+    (encode-instruction state 'mov (list 'ebx table))
+    (encode-instruction state 'call (list (list :MEM :DWORD 'ebx 'eax 4 0)))
+    (encode-instruction state 'popad '())
+    (encode-instruction state 'iret '())
+    (emit-label state bad-label)
+    (encode-instruction state 'popad '())
+    (encode-instruction state 'iret '())
+    (emit-align state 4)
+    (emit-label state table)
+    (let ((index-map (make-hash-table :test #'eql)))
+      (dolist (entry (syscall-table-descriptor-entries st))
+        (setf (gethash (car entry) index-map) (cdr entry)))
+      (dotimes (idx count)
+        (let ((target (gethash idx index-map)))
+          (emit-dd state (list (or target bad-label))))))))
+
 (defun pre-scan-section (environment body)
   (dolist (form body)
     (when (consp form)
@@ -1880,7 +2184,11 @@
         (:block-device
          (register-block-device environment form))
         (:memory-map
-         (register-memory-map environment form))))))
+         (register-memory-map environment form))
+        (:phys-allocator-bootstrap
+         (register-phys-allocator environment form))
+        (:syscall-table
+         (register-syscall-table environment form))))))
 
 (defun emit-keyboard-read (environment args)
   (require-bits environment 32 "KEYBOARD-READ")
@@ -2224,6 +2532,24 @@
        (emit-memory-map-base environment (rest form)))
       (:memory-map-count
        (emit-memory-map-count environment (rest form)))
+      (:phys-allocator-bootstrap
+       (emit-phys-allocator-bootstrap environment form))
+      (:phys-allocator-init
+       (emit-phys-allocator-init environment (rest form)))
+      (:phys-alloc
+       (emit-phys-alloc environment (rest form)))
+      (:phys-free
+       (emit-phys-free environment (rest form)))
+      (:execution-slot
+       (emit-execution-slot environment form))
+      (:context-save
+       (emit-context-save environment (rest form)))
+      (:context-restore
+       (emit-context-restore environment (rest form)))
+      (:context-init
+       (emit-context-init environment (rest form)))
+      (:syscall-table
+       (emit-syscall-table environment form))
       (:load-section
        (destructuring-bind (_ section-name &rest args) form
          (declare (ignore _))
@@ -2251,7 +2577,9 @@
         :constants (make-hash-table :test 'eq)
         :keyboards (make-hash-table :test 'eq)
         :block-devices (make-hash-table :test 'eq)
-        :memory-maps (make-hash-table :test 'eq))))
+        :memory-maps (make-hash-table :test 'eq)
+        :phys-allocators (make-hash-table :test 'eq)
+        :syscall-tables (make-hash-table :test 'eq))))
     (pre-scan-section environment (section-spec-body section))
     (dolist (form (section-spec-body section))
       (compile-form environment form))
