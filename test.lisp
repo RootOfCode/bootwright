@@ -61,6 +61,63 @@
       (encode s 'svc '(0))
       (assert-bytes s '(#x01 #x00 #x00 #xD4) "aarch64 SVC #0"))
     (format t "Bootwright Phase 1 byte-level tests passed.~%"))
+  (let* ((helper-path (merge-pathnames "examples/cpu/lib/gdt-flat.bwo" root))
+         (os-package (find-package '#:bootwright.os)))
+    (let ((*package* os-package))
+      (load helper-path :verbose nil :print nil))
+    (let* ((flat-gdt (symbol-function (find-symbol "FLAT-GDT" os-package)))
+           (gdt (intern "GDT" os-package))
+           (gdt-descriptor (intern "GDT-DESCRIPTOR" os-package))
+           (expected `(,gdt ,gdt (:pointer ,gdt-descriptor)
+                        (:null)
+                        (:code32 :base :section :limit 720895)
+                        (:data32 :base :section :limit 720895))))
+      (unless (equal (funcall flat-gdt gdt :pointer gdt-descriptor)
+                     expected)
+        (error "Example helper test failed: FLAT-GDT returned an unexpected form.")))
+    (format t "Bootwright example helper tests passed.~%"))
+  (let ((make-image-spec (symbol-function (find-symbol "MAKE-IMAGE-SPEC" "BOOTWRIGHT")))
+        (build-image (symbol-function (find-symbol "BUILD-IMAGE" "BOOTWRIGHT"))))
+    (handler-case
+        (progn
+          (funcall build-image
+                   (funcall make-image-spec
+                            :name '*overlap-check*
+                            :target '(:x86-bios)
+                            :sections '((boot-sector (:entry boot)
+                                          (routine boot
+                                            (hang)))
+                                        (kernel-section alpha (:load-segment #x1000 :entry alpha-main)
+                                          (routine alpha-main
+                                            (ret)))
+                                        (kernel-section beta (:load-segment #x1000 :entry beta-main)
+                                          (routine beta-main
+                                            (ret))))))
+          (error "Phase 8 overlap test failed: overlapping sections built successfully."))
+      (error (condition)
+        (unless (search "overlap" (string-downcase (princ-to-string condition)))
+          (error "Phase 8 overlap test failed with unexpected condition: ~A" condition))))
+    (handler-case
+        (progn
+          (funcall build-image
+                   (funcall make-image-spec
+                            :name '*stack-check*
+                            :target '(:x86-bios)
+                            :sections '((boot-sector (:entry boot)
+                                          (routine boot
+                                            (initialize-real-mode :stack 2)
+                                            (call first)
+                                            (hang))
+                                          (routine first
+                                            (call second)
+                                            (ret))
+                                          (routine second
+                                            (ret))))))
+          (error "Phase 8 stack test failed: overflowing stack built successfully."))
+      (error (condition)
+        (unless (search "stack" (string-downcase (princ-to-string condition)))
+          (error "Phase 8 stack test failed with unexpected condition: ~A" condition))))
+    (format t "Bootwright Phase 8 compile-time checks passed.~%"))
   (labels ((test-source (source &rest args)
              (apply (symbol-function (find-symbol "TEST-OS-SOURCE-FILE" "BOOTWRIGHT"))
                     (merge-pathnames source root)
@@ -74,10 +131,26 @@
                  :expect-debugcon '("stage1: loading protected-mode demo"
                                     "kernel: protected mode + paging active"
                                     "kernel: returned from int 0x30"))
+    (test-source "examples/protected/demo-paging.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading paging demo"
+                                    "kernel: paging demo reached"
+                                    "kernel: paging enabled via page-structures"
+                                    "kernel: alias page remapped"))
     (test-source "examples/basics/demo-assets.bwo"
                  :timeout-ms 3000
                  :expect-debugcon '("stage1: loading asset demo"
                                     "kernel: asset demo reached"))
+    (test-source "examples/basics/demo-scroll.bwo"
+                 :timeout-ms 3000
+                 :expect-debugcon '("stage1: loading scroll demo"
+                                    "kernel: scroll demo reached"
+                                    "kernel: framebuffer-scroll ok"))
+    (test-source "examples/personality/demo-personality.bwo"
+                 :timeout-ms 3000
+                 :expect-debugcon '("stage1: loading personality demo"
+                                    "kernel: personality demo reached"
+                                    "kernel: personality forms ok"))
     (test-source "examples/devices/demo-timer.bwo"
                  :timeout-ms 5000
                  :expect-debugcon '("stage1: loading timer demo"
@@ -111,6 +184,10 @@
                  :expect-debugcon '("stage1: loading ata demo"
                                     "kernel: ata demo reached"
                                     "kernel: ata read ok (sig=0xAA55)"))
+    (test-source "examples/devices/demo-keyboard.bwo"
+                 :timeout-ms 3000
+                 :expect-debugcon '("stage1: loading keyboard demo"
+                                    "kernel: keyboard demo reached"))
     (test-source "examples/devices/demo-memmap.bwo"
                  :timeout-ms 5000
                  :expect-debugcon '("stage1: loading memmap demo"

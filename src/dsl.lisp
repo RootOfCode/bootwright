@@ -3,7 +3,7 @@
 (defstruct (compile-environment
             (:constructor make-compile-environment
                 (&key target section layouts state helpers constants keyboards
-                      block-devices memory-maps phys-allocators syscall-tables
+                      block-devices memory-maps phys-allocators page-structures syscall-tables
                       slot-types partition-tables volumes)))
   target
   section
@@ -15,6 +15,7 @@
   block-devices
   memory-maps
   phys-allocators
+  page-structures
   syscall-tables
   slot-types
   partition-tables
@@ -392,6 +393,325 @@ by linear address. Three fixups patch base[15:0], base[23:16], and base[31:24]."
           (emit-label state pointer-label)
           (emit-dw state (list (1- (* count 8))))
           (emit-dd state (list (list :linear name))))))))
+
+(defstruct (page-structures-descriptor
+            (:constructor make-page-structures-descriptor
+                (&key name levels granularity base-address
+                      coverage-start coverage-end flags)))
+  name
+  levels
+  granularity
+  base-address
+  coverage-start
+  coverage-end
+  flags)
+
+(defun unwrap-quoted-value (value)
+  (if (and (consp value)
+           (eq (first value) 'quote)
+           (= (length value) 2))
+      (second value)
+      value))
+
+(defun parse-page-structures-options (environment raw-options)
+  (let ((items (resolve-operands environment raw-options))
+        (levels 2)
+        (granularity :4kb)
+        (base-address nil)
+        (coverage-start nil)
+        (coverage-end nil)
+        (flags '(:present :writable)))
+    (loop while items do
+      (let ((key (token-keyword (pop items))))
+        (case key
+          (:levels
+           (setf levels (or (pop items)
+                            (error "PAGE-STRUCTURES :LEVELS requires a value."))))
+          (:granularity
+           (setf granularity (or (pop items)
+                                 (error "PAGE-STRUCTURES :GRANULARITY requires a value."))))
+          (:base-address
+           (setf base-address (or (pop items)
+                                  (error "PAGE-STRUCTURES :BASE-ADDRESS requires a value."))))
+          (:coverage
+           (if (and items (consp (first items)))
+               (destructuring-bind (start end) (pop items)
+                 (setf coverage-start start
+                       coverage-end end))
+               (let ((start (pop items))
+                     (end (pop items)))
+                 (when (or (null start) (null end))
+                   (error "PAGE-STRUCTURES :COVERAGE requires a start and end address."))
+                 (setf coverage-start start
+                       coverage-end end))))
+          (:flags
+           (setf flags (or (pop items)
+                           (error "PAGE-STRUCTURES :FLAGS requires a value."))))
+          (t
+           (error "Unsupported PAGE-STRUCTURES option ~S." key)))))
+    (values levels granularity base-address coverage-start coverage-end flags)))
+
+(defun parse-page-structures-form (environment form)
+  (let ((name (or (second form)
+                  (error "PAGE-STRUCTURES requires a name."))))
+    (multiple-value-bind (levels granularity base-address coverage-start coverage-end flags)
+        (parse-page-structures-options environment
+                                       (or (third form)
+                                           (error "PAGE-STRUCTURES ~S requires an options list." name)))
+      (unless (and (integerp levels) (<= 1 levels 4))
+        (error "PAGE-STRUCTURES :LEVELS must be an integer from 1 to 4, got ~S." levels))
+      (setf granularity (token-keyword granularity))
+      (unless (member granularity '(:4kb :4mib))
+        (error "PAGE-STRUCTURES currently supports :4KB and :4MIB granularities, got ~S."
+               granularity))
+      (unless (and (integerp coverage-start)
+                   (integerp coverage-end)
+                   (<= 0 coverage-start coverage-end #xFFFFFFFF))
+        (error "PAGE-STRUCTURES :COVERAGE must be two 32-bit addresses in ascending order, got ~S .. ~S."
+               coverage-start coverage-end))
+      (when base-address
+        (unless (and (integerp base-address) (<= 0 base-address #xFFFFFFFF))
+          (error "PAGE-STRUCTURES :BASE-ADDRESS must be a 32-bit non-negative integer, got ~S."
+                 base-address)))
+      (make-page-structures-descriptor
+       :name name
+       :levels levels
+       :granularity granularity
+       :base-address base-address
+       :coverage-start coverage-start
+       :coverage-end coverage-end
+       :flags flags))))
+
+(defun register-page-structures (environment form)
+  (let* ((descriptor (parse-page-structures-form environment form))
+         (name (page-structures-descriptor-name descriptor)))
+    (when (gethash name (compile-environment-page-structures environment))
+      (error "PAGE-STRUCTURES ~S is already declared in this section." name))
+    (setf (gethash name (compile-environment-page-structures environment)) descriptor)
+    descriptor))
+
+(defun lookup-page-structures (environment name)
+  (or (gethash name (compile-environment-page-structures environment))
+      (error "Unknown page-structures ~S — is (page-structures ~S ...) declared in this section?"
+             name name)))
+
+(defun page-entry-unit-size (descriptor)
+  (ecase (page-structures-descriptor-granularity descriptor)
+    (:4kb 4096)
+    (:4mib #x400000)))
+
+(defun page-directory-index-range (descriptor)
+  (values (truncate (page-structures-descriptor-coverage-start descriptor) #x400000)
+          (truncate (page-structures-descriptor-coverage-end descriptor) #x400000)))
+
+(defun page-coverage-contains-p (descriptor address)
+  (and (integerp address)
+       (<= (page-structures-descriptor-coverage-start descriptor)
+           address
+           (page-structures-descriptor-coverage-end descriptor))))
+
+(defun page-structure-table-label (descriptor directory-index)
+  (intern (format nil "~A-TABLE-~D"
+                  (symbol-name (page-structures-descriptor-name descriptor))
+                  directory-index)
+          (or (symbol-package (page-structures-descriptor-name descriptor))
+              *package*)))
+
+(defun page-flags-mask (flags &key table-pointer large-page)
+  (let* ((flags (unwrap-quoted-value flags))
+         (value (cond ((integerp flags)
+                       flags)
+                      ((null flags)
+                       0)
+                      ((listp flags)
+                       (loop for flag in flags
+                             for keyword = (token-keyword flag)
+                             sum (case keyword
+                                   (:present #x001)
+                                   (:writable #x002)
+                                   (:writeable #x002)
+                                   (:user #x004)
+                                   (:write-through #x008)
+                                   (:cache-disable #x010)
+                                   (:accessed #x020)
+                                   (:dirty #x040)
+                                   (:page-size #x080)
+                                   (:large-page #x080)
+                                   (:global #x100)
+                                   (t
+                                    (error "Unknown paging flag ~S." flag)))))
+                      (t
+                       (error "Unsupported paging flags designator ~S." flags)))))
+    (when large-page
+      (setf value (logior value #x080)))
+    (if table-pointer
+        (logand value #x03F)
+        value)))
+
+(defun emit-page-structures (environment form)
+  (let* ((state (compile-environment-state environment))
+         (descriptor (lookup-page-structures environment (second form)))
+         (name (page-structures-descriptor-name descriptor))
+         (levels (page-structures-descriptor-levels descriptor))
+         (granularity (page-structures-descriptor-granularity descriptor))
+         (base-address (page-structures-descriptor-base-address descriptor))
+         (coverage-start (page-structures-descriptor-coverage-start descriptor))
+         (coverage-end (page-structures-descriptor-coverage-end descriptor))
+         (flags (page-structures-descriptor-flags descriptor))
+         (section-base (section-linear-base (compile-environment-section environment))))
+    (unless (= levels 2)
+      (error "PAGE-STRUCTURES currently supports only 2-level paging on x86-32, got :LEVELS ~S."
+             levels))
+    (if base-address
+        (progn
+          (unless (zerop (mod base-address 4096))
+            (error "PAGE-STRUCTURES :BASE-ADDRESS must be 4 KiB aligned, got ~S." base-address))
+          (let ((offset (- base-address section-base)))
+            (when (minusp offset)
+              (error "PAGE-STRUCTURES :BASE-ADDRESS ~S is below this section's base address ~S."
+                     base-address section-base))
+            (emit-pad-to state offset 0)))
+        (emit-align state 4096))
+    (multiple-value-bind (first-directory last-directory)
+        (page-directory-index-range descriptor)
+      (emit-label state name)
+      (ecase granularity
+        (:4mib
+         (let ((entry-flags (page-flags-mask flags :large-page t)))
+           (dotimes (index 1024)
+             (if (<= first-directory index last-directory)
+                 (emit-dd state (list (+ (* index #x400000) entry-flags)))
+                 (emit-dd state '(0))))))
+        (:4kb
+         (let ((directory-flags (page-flags-mask flags :table-pointer t))
+               (page-flags (page-flags-mask flags)))
+           (dotimes (index 1024)
+             (if (<= first-directory index last-directory)
+                 (emit-dd state (list (list :linear+
+                                            (page-structure-table-label descriptor index)
+                                            directory-flags)))
+                 (emit-dd state '(0))))
+           (loop for directory-index from first-directory to last-directory do
+             (emit-label state (page-structure-table-label descriptor directory-index))
+             (dotimes (entry 1024)
+               (let ((page-base (+ (* directory-index #x400000) (* entry 4096))))
+                 (if (and (>= page-base coverage-start)
+                          (<= page-base coverage-end))
+                     (emit-dd state (list (+ page-base page-flags)))
+                     (emit-dd state '(0))))))))))))
+
+(defun ensure-runtime-address-operand (operand context)
+  (let ((operand (resolve-operand context operand)))
+    (cond ((or (integerp operand)
+               (dword-register-p operand)
+               (linear-reference-p operand)
+               (linear-addend-reference-p operand))
+           operand)
+          ((and (symbolp operand)
+                (not (register-symbol-p operand))
+                (not (keywordp operand)))
+           (list :linear operand))
+          (t
+           (error "Expected an integer, 32-bit register, or linear address reference, got ~S."
+                  operand)))))
+
+(defun ensure-page-structure-coverage (descriptor virtual-address form-name)
+  (when (integerp virtual-address)
+    (unless (page-coverage-contains-p descriptor virtual-address)
+      (error "~A virtual address ~S is outside PAGE-STRUCTURES coverage ~S .. ~S."
+             form-name
+             virtual-address
+             (page-structures-descriptor-coverage-start descriptor)
+             (page-structures-descriptor-coverage-end descriptor)))))
+
+(defun emit-map-page (environment args)
+  (require-bits environment 32 "MAP-PAGE")
+  (let* ((state (compile-environment-state environment))
+         (descriptor-name (or (first args)
+                              (error "MAP-PAGE requires a page-structures name.")))
+         (descriptor (lookup-page-structures environment descriptor-name))
+         (options (resolve-operands environment (rest args)))
+         (virtual (ensure-runtime-address-operand
+                   (or (getf options :virtual)
+                       (error "MAP-PAGE requires :VIRTUAL."))
+                   environment))
+         (physical (ensure-runtime-address-operand
+                    (or (getf options :physical)
+                        (error "MAP-PAGE requires :PHYSICAL."))
+                    environment))
+         (flags (page-flags-mask (getf options :flags '(:present :writable))
+                                 :large-page (eq (page-structures-descriptor-granularity descriptor)
+                                                 :4mib)))
+         (section-base (section-linear-base (compile-environment-section environment)))
+         (done-label (gensym "MAP-PAGE-DONE-")))
+    (ensure-page-structure-coverage descriptor virtual "MAP-PAGE")
+    (case (page-structures-descriptor-granularity descriptor)
+      (:4mib
+       (encode-instruction state 'mov (list 'eax virtual))
+       (encode-instruction state 'shr '(eax 22))
+       (encode-instruction state 'and '(eax #x3FF))
+       (encode-instruction state 'mov (list 'ebx descriptor-name))
+       (encode-instruction state 'mov (list 'edx physical))
+       (encode-instruction state 'and '(edx #xFFC00000))
+       (encode-instruction state 'or (list 'edx flags))
+       (encode-instruction state 'mov (list (list :MEM :DWORD 'ebx 'eax 4 0) 'edx)))
+      (:4kb
+       (encode-instruction state 'mov (list 'eax virtual))
+       (encode-instruction state 'mov '(edx eax))
+       (encode-instruction state 'shr '(eax 22))
+       (encode-instruction state 'and '(eax #x3FF))
+       (encode-instruction state 'mov '(ecx edx))
+       (encode-instruction state 'shr '(ecx 12))
+       (encode-instruction state 'and '(ecx #x3FF))
+       (encode-instruction state 'mov (list 'ebx descriptor-name))
+       (encode-instruction state 'mov (list 'ebx (list :MEM :DWORD 'ebx 'eax 4 0)))
+       (encode-instruction state 'test '(ebx ebx))
+       (encode-instruction state 'jz (list done-label))
+       (encode-instruction state 'and '(ebx #xFFFFF000))
+       (encode-instruction state 'sub (list 'ebx section-base))
+       (encode-instruction state 'mov (list 'eax physical))
+       (encode-instruction state 'and '(eax #xFFFFF000))
+       (encode-instruction state 'or (list 'eax flags))
+       (encode-instruction state 'mov (list (list :MEM :DWORD 'ebx 'ecx 4 0) 'eax))
+       (emit-label state done-label)))))
+
+(defun emit-unmap-page (environment args)
+  (require-bits environment 32 "UNMAP-PAGE")
+  (let* ((state (compile-environment-state environment))
+         (descriptor-name (or (first args)
+                              (error "UNMAP-PAGE requires a page-structures name.")))
+         (descriptor (lookup-page-structures environment descriptor-name))
+         (options (resolve-operands environment (rest args)))
+         (virtual (ensure-runtime-address-operand
+                   (or (getf options :virtual)
+                       (error "UNMAP-PAGE requires :VIRTUAL."))
+                   environment))
+         (section-base (section-linear-base (compile-environment-section environment)))
+         (done-label (gensym "UNMAP-PAGE-DONE-")))
+    (ensure-page-structure-coverage descriptor virtual "UNMAP-PAGE")
+    (case (page-structures-descriptor-granularity descriptor)
+      (:4mib
+       (encode-instruction state 'mov (list 'eax virtual))
+       (encode-instruction state 'shr '(eax 22))
+       (encode-instruction state 'and '(eax #x3FF))
+       (encode-instruction state 'mov (list 'ebx descriptor-name))
+       (encode-instruction state 'mov (list (list :MEM :DWORD 'ebx 'eax 4 0) 0)))
+      (:4kb
+       (encode-instruction state 'mov (list 'eax virtual))
+       (encode-instruction state 'mov '(edx eax))
+       (encode-instruction state 'shr '(eax 22))
+       (encode-instruction state 'and '(eax #x3FF))
+       (encode-instruction state 'mov '(ecx edx))
+       (encode-instruction state 'shr '(ecx 12))
+       (encode-instruction state 'and '(ecx #x3FF))
+       (encode-instruction state 'mov (list 'ebx descriptor-name))
+       (encode-instruction state 'mov (list 'ebx (list :MEM :DWORD 'ebx 'eax 4 0)))
+       (encode-instruction state 'test '(ebx ebx))
+       (encode-instruction state 'jz (list done-label))
+       (encode-instruction state 'and '(ebx #xFFFFF000))
+       (encode-instruction state 'sub (list 'ebx section-base))
+       (encode-instruction state 'mov (list (list :MEM :DWORD 'ebx 'ecx 4 0) 0))
+       (emit-label state done-label)))))
 
 (defun emit-page-table (environment form)
   (let* ((state (compile-environment-state environment))
@@ -914,6 +1234,64 @@ by linear address. Three fixups patch base[15:0], base[23:16], and base[31:24]."
                                           (vga-text-framebuffer-default-attribute framebuffer))
                          args))))
 
+(defun emit-framebuffer-scroll (environment framebuffer-designator args)
+  (require-bits environment 32 "FRAMEBUFFER-SCROLL")
+  (let* ((state (compile-environment-state environment))
+         (framebuffer (resolve-framebuffer-device environment framebuffer-designator))
+         (args (resolve-operands environment args))
+         (columns (vga-text-framebuffer-columns framebuffer))
+         (rows (vga-text-framebuffer-rows framebuffer))
+         (lines (getf args :lines 1))
+         (attribute (getf args :attribute
+                          (vga-text-framebuffer-default-attribute framebuffer)))
+         (character (getf args :char 32))
+         (base-address (vga-text-framebuffer-base-address framebuffer))
+         (section-base (section-linear-base (compile-environment-section environment)))
+         (base-offset (- base-address section-base))
+         (moved-cells (* columns (max 0 (- rows lines))))
+         (clear-cells (* columns lines))
+         (source-offset (+ base-offset (* lines columns 2)))
+         (clear-offset (+ base-offset (* moved-cells 2)))
+         (copy-loop (gensym "FB-SCROLL-COPY-"))
+         (copy-done (gensym "FB-SCROLL-COPY-DONE-"))
+         (clear-loop (gensym "FB-SCROLL-CLEAR-"))
+         (clear-done (gensym "FB-SCROLL-CLEAR-DONE-")))
+    (unless (and (integerp lines) (<= 0 lines rows))
+      (error "FRAMEBUFFER-SCROLL :LINES must be an integer from 0 to ~D, got ~S."
+             rows lines))
+    (when (minusp base-offset)
+      (error "Framebuffer address #x~X is below the current section base #x~X."
+             base-address section-base))
+    (unless (and (integerp attribute) (typep attribute '(integer 0 255)))
+      (error "FRAMEBUFFER-SCROLL :ATTRIBUTE must fit in one byte, got ~S." attribute))
+    (unless (and (integerp character) (typep character '(integer 0 255)))
+      (error "FRAMEBUFFER-SCROLL :CHAR must fit in one byte, got ~S." character))
+    (encode-instruction state 'cld '())
+    (encode-instruction state 'mov (list 'esi source-offset))
+    (encode-instruction state 'mov (list 'edi base-offset))
+    (encode-instruction state 'mov (list 'ecx moved-cells))
+    (emit-label state copy-loop)
+    (encode-instruction state 'test '(ecx ecx))
+    (encode-instruction state 'jz (list copy-done))
+    (encode-instruction state 'mov '(ax (:mem :word esi)))
+    (encode-instruction state 'mov '((:mem :word edi) ax))
+    (encode-instruction state 'add '(esi 2))
+    (encode-instruction state 'add '(edi 2))
+    (encode-instruction state 'dec '(ecx))
+    (encode-instruction state 'jmp (list copy-loop))
+    (emit-label state copy-done)
+    (encode-instruction state 'mov (list 'edi clear-offset))
+    (encode-instruction state 'mov (list 'ecx clear-cells))
+    (encode-instruction state 'mov (list 'ah attribute))
+    (encode-instruction state 'mov (list 'al character))
+    (emit-label state clear-loop)
+    (encode-instruction state 'test '(ecx ecx))
+    (encode-instruction state 'jz (list clear-done))
+    (encode-instruction state 'stosw '())
+    (encode-instruction state 'dec '(ecx))
+    (encode-instruction state 'jmp (list clear-loop))
+    (emit-label state clear-done)))
+
 (defun emit-hang (environment)
   (let* ((state (compile-environment-state environment))
          (loop-label (gensym "HANG-")))
@@ -1370,6 +1748,19 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
 (defun emit-irq-end-of-interrupt (environment args)
   (emit-pic-eoi environment args))
 
+(defun emit-irq-handler (environment args)
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (irq (or (first args)
+                  (error "IRQ-HANDLER requires an IRQ number.")))
+         (handler (or (second args)
+                      (error "IRQ-HANDLER requires a handler label."))))
+    (unless (and (integerp irq) (<= 0 irq 255))
+      (error "IRQ-HANDLER IRQ must be an integer from 0 to 255, got ~S." irq))
+    (encode-instruction state 'call (list handler))
+    (emit-irq-end-of-interrupt environment (list irq))
+    (encode-instruction state 'iret '())))
+
 (defun emit-timer-set-frequency (environment args)
   (typecase (machine-timer-device-or-die environment)
     (pit8253-timer
@@ -1501,6 +1892,18 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
     (encode-instruction state 'in '(al dx))
     (unless (eql (token-keyword destination) :AL)
       (encode-instruction state 'mov (list destination 'al)))))
+
+(defun emit-uart-tx-ready-p (environment args)
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (device (resolve-serial-device environment (first args)))
+         (ready-label (or (second args)
+                          (error "UART-TX-READY-P requires a device and branch label.")))
+         (status-port (+ (uart16550-device-base-port device) 5)))
+    (encode-instruction state 'mov (list 'dx status-port))
+    (encode-instruction state 'in '(al dx))
+    (encode-instruction state 'and '(al #x20))
+    (encode-instruction state 'jnz (list ready-label))))
 
 (defun emit-uart-print (environment args)
   (let* ((state (compile-environment-state environment))
@@ -2276,24 +2679,39 @@ volume's runtime START-LBA cell."
 
 (defstruct (memory-map-descriptor
             (:constructor make-memory-map-descriptor
-                (&key name source max-entries entries-label)))
-  name source max-entries entries-label)
+                (&key name source max-entries entries-label reserved-ranges)))
+  name source max-entries entries-label reserved-ranges)
 
 (defun parse-memory-map-form (environment form)
   (let* ((name (or (second form) (error "MEMORY-MAP requires a name.")))
-         (options (resolve-operands environment (third form)))
+         (rest (cddr form)))
+    (multiple-value-bind (raw-options entries)
+        (parse-leading-options rest '(:source :max-entries))
+      (let* ((options (resolve-operands environment raw-options))
          (source (or (getf options :source) :bios-e820))
-         (max-entries (or (getf options :max-entries) 32)))
-    (unless (eq source :bios-e820)
-      (error "MEMORY-MAP currently only supports :BIOS-E820, got ~S." source))
-    (unless (and (integerp max-entries) (>= max-entries 1) (<= max-entries 256))
-      (error "MEMORY-MAP :MAX-ENTRIES must be 1..256, got ~S." max-entries))
-    (make-memory-map-descriptor
-     :name name
-     :source source
-     :max-entries max-entries
-     :entries-label (intern (concatenate 'string (symbol-name name) "-ENTRIES")
-                            (or (symbol-package name) *package*)))))
+             (max-entries (or (getf options :max-entries) 32))
+             (reserved-ranges nil))
+        (unless (eq source :bios-e820)
+          (error "MEMORY-MAP currently only supports :BIOS-E820, got ~S." source))
+        (unless (and (integerp max-entries) (>= max-entries 1) (<= max-entries 256))
+          (error "MEMORY-MAP :MAX-ENTRIES must be 1..256, got ~S." max-entries))
+        (dolist (entry entries)
+          (destructuring-bind (kind start end) (resolve-operands environment entry)
+            (unless (eq (token-keyword kind) :reserved)
+              (error "Unsupported MEMORY-MAP entry form ~S." kind))
+            (unless (and (integerp start)
+                         (integerp end)
+                         (<= 0 start end #xFFFFFFFF))
+              (error "MEMORY-MAP reserved range must be 32-bit ascending addresses, got ~S .. ~S."
+                     start end))
+            (push (cons start end) reserved-ranges)))
+        (make-memory-map-descriptor
+         :name name
+         :source source
+         :max-entries max-entries
+         :entries-label (intern (concatenate 'string (symbol-name name) "-ENTRIES")
+                                (or (symbol-package name) *package*))
+         :reserved-ranges (nreverse reserved-ranges))))))
 
 (defun register-memory-map (environment form)
   (let* ((mm (parse-memory-map-form environment form))
@@ -2360,6 +2778,86 @@ volume's runtime START-LBA cell."
          (mm (lookup-memory-map environment mm-name))
          (state (compile-environment-state environment)))
     (encode-instruction state 'mov (list dest (list :MEM :DWORD (memory-map-descriptor-name mm))))))
+
+(defun memory-map-type-value (designator)
+  (let ((designator (unwrap-quoted-value designator)))
+    (cond ((or (null designator) (eq designator t))
+           nil)
+          ((integerp designator)
+           designator)
+          ((symbolp designator)
+           (case (token-keyword designator)
+             (:available 1)
+             (:reserved 2)
+             (:acpi-reclaimable 3)
+             (:acpi-nvs 4)
+             (:bad 5)
+             (t
+              (error "Unknown MEMORY-MAP-ITERATE :TYPE designator ~S." designator))))
+          (t
+           (error "Unsupported MEMORY-MAP-ITERATE :TYPE designator ~S." designator)))))
+
+(defun parse-memory-map-iterate-args (environment args)
+  (let* ((body-position (position-if (lambda (item)
+                                       (and (typep item '(or symbol string))
+                                            (eq (token-keyword item) :body)))
+                                     args))
+         (mm-name (or (first args)
+                      (error "MEMORY-MAP-ITERATE requires a memory-map name."))))
+    (when (null body-position)
+      (error "MEMORY-MAP-ITERATE requires a :BODY clause."))
+    (let* ((option-items (subseq args 1 body-position))
+           (body-items (subseq args (1+ body-position)))
+           (options (resolve-operands environment option-items))
+           (body (if (and (= (length body-items) 1)
+                          (consp (first body-items))
+                          (every #'consp (first body-items)))
+                     (first body-items)
+                     body-items)))
+      (values mm-name options body))))
+
+(defun emit-memory-map-iterate (environment args)
+  (require-bits environment 32 "MEMORY-MAP-ITERATE")
+  (multiple-value-bind (mm-name options body)
+      (parse-memory-map-iterate-args environment args)
+    (let* ((state (compile-environment-state environment))
+           (mm (lookup-memory-map environment mm-name))
+           (base-reg (or (getf options :base-reg)
+                         (error "MEMORY-MAP-ITERATE requires :BASE-REG.")))
+           (length-reg (or (getf options :length-reg)
+                           (error "MEMORY-MAP-ITERATE requires :LENGTH-REG.")))
+           (entry-reg (getf options :entry-reg))
+           (type-reg (getf options :type-reg))
+           (type-filter (memory-map-type-value (getf options :type)))
+           (loop-label (gensym "MMAP-ITERATE-"))
+           (skip-label (gensym "MMAP-SKIP-"))
+           (done-label (gensym "MMAP-DONE-")))
+      (dolist (reg (remove nil (list base-reg length-reg entry-reg type-reg)))
+        (unless (dword-register-p reg)
+          (error "MEMORY-MAP-ITERATE registers must be 32-bit general registers, got ~S." reg))
+        (when (member reg '(edi ebp))
+          (error "MEMORY-MAP-ITERATE reserves EDI and EBP for loop state; got ~S." reg)))
+      (encode-instruction state 'mov (list 'edi (memory-map-descriptor-entries-label mm)))
+      (encode-instruction state 'mov (list 'ebp (list :MEM :DWORD (memory-map-descriptor-name mm))))
+      (emit-label state loop-label)
+      (encode-instruction state 'test '(ebp ebp))
+      (encode-instruction state 'jz (list done-label))
+      (when type-filter
+        (encode-instruction state 'cmp (list (list :MEM :DWORD 'edi 16) type-filter))
+        (encode-instruction state 'jne-near (list skip-label)))
+      (encode-instruction state 'mov (list base-reg (list :MEM :DWORD 'edi 0)))
+      (encode-instruction state 'mov (list length-reg (list :MEM :DWORD 'edi 8)))
+      (when entry-reg
+        (encode-instruction state 'mov (list entry-reg 'edi)))
+      (when type-reg
+        (encode-instruction state 'mov (list type-reg (list :MEM :DWORD 'edi 16))))
+      (dolist (nested-form body)
+        (compile-form environment nested-form))
+      (emit-label state skip-label)
+      (encode-instruction state 'add '(edi 24))
+      (encode-instruction state 'dec '(ebp))
+      (encode-instruction state 'jmp (list loop-label))
+      (emit-label state done-label))))
 
 (defstruct (phys-allocator-descriptor
             (:constructor make-phys-allocator-descriptor
@@ -2734,6 +3232,8 @@ volume's runtime START-LBA cell."
          (register-memory-map environment form))
         (:phys-allocator-bootstrap
          (register-phys-allocator environment form))
+        (:page-structures
+         (register-page-structures environment form))
         (:syscall-table
          (register-syscall-table environment form))
         (:execution-slot-type
@@ -2742,6 +3242,336 @@ volume's runtime START-LBA cell."
          (register-partition-table environment form))
         (:volume
          (register-volume environment form))))))
+
+(defstruct (routine-stack-descriptor
+            (:constructor make-routine-stack-descriptor
+                (&key name body initial-bits constants)))
+  name
+  body
+  initial-bits
+  constants)
+
+(defstruct (stack-root-descriptor
+            (:constructor make-stack-root-descriptor
+                (&key routine stack-top-linear bits origin-form)))
+  routine
+  stack-top-linear
+  bits
+  origin-form)
+
+(defun stack-analysis-resolve-operand (constants operand)
+  (cond ((and (symbolp operand)
+              (multiple-value-bind (_ present)
+                  (gethash operand constants)
+                (declare (ignore _))
+                present))
+         (stack-analysis-resolve-operand constants (gethash operand constants)))
+        ((consp operand)
+         (mapcar (lambda (item)
+                   (stack-analysis-resolve-operand constants item))
+                 operand))
+        (t
+         operand)))
+
+(defun stack-analysis-word-bytes (bits)
+  (ecase bits
+    (16 2)
+    (32 4)))
+
+(defun stack-analysis-clamp-depth (depth)
+  (max 0 depth))
+
+(defun stack-analysis-terminal-form-p (form)
+  (let ((op (token-keyword (first form))))
+    (member op '(:hang :idle-forever :context-restore :privilege-drop :jump-section
+                  :iret :ret :retf :lret :sysexit :sysret
+                  :jmp :ljmp16 :ljmp32)
+            :test #'eq)))
+
+(defun stack-analysis-helper-call-form-p (form)
+  (member (token-keyword (first form))
+          '(:bios-print :debug-print :vga-print :vga-print-hex
+            :vga-print-decimal :vga-print-ascii4 :serial-print
+            :phys-alloc :phys-free)
+          :test #'eq))
+
+(defun stack-analysis-direct-call-target (constants operand)
+  (let ((resolved (stack-analysis-resolve-operand constants operand)))
+    (and (symbolp resolved) resolved)))
+
+(defun collect-section-routines-for-stack-analysis (body)
+  (let ((bits 16)
+        (constants (make-hash-table :test 'eq))
+        (routines '()))
+    (labels ((record-const (name value)
+               (setf (gethash name constants)
+                     (stack-analysis-resolve-operand constants value)))
+             (walk (forms)
+               (dolist (form forms)
+                 (when (consp form)
+                   (case (token-keyword (first form))
+                     (:const
+                      (destructuring-bind (_ name value) form
+                        (declare (ignore _))
+                        (record-const name value)))
+                     (:bits
+                      (destructuring-bind (_ next-bits) form
+                        (declare (ignore _))
+                        (setf bits (stack-analysis-resolve-operand constants next-bits))))
+                     (:repeat
+                      (destructuring-bind (_ count &body repeated-body) form
+                        (declare (ignore _))
+                        (let ((count (stack-analysis-resolve-operand constants count)))
+                          (unless (and (integerp count) (not (minusp count)))
+                            (error "REPEAT requires a non-negative integer count, got ~S." count))
+                          (loop repeat count do
+                            (walk repeated-body)))))
+                     (:routine
+                      (destructuring-bind (_ name &body routine-body) form
+                        (declare (ignore _))
+                        (push (make-routine-stack-descriptor
+                               :name name
+                               :body routine-body
+                               :initial-bits bits
+                               :constants (copy-label-table constants))
+                              routines)
+                        ;; CONST/BITS inside routines persist in the section-wide
+                        ;; compile environment, so mirror that behavior here.
+                        (walk routine-body)))
+                     (t nil))))))
+      (walk body)
+      (nreverse routines))))
+
+(defun build-routine-stack-table (routines)
+  (let ((table (make-hash-table :test 'eq)))
+    (dolist (descriptor routines)
+      (setf (gethash (routine-stack-descriptor-name descriptor) table)
+            descriptor))
+    table))
+
+(defun infer-routine-initial-stack-root (section descriptor)
+  (let ((bits (routine-stack-descriptor-initial-bits descriptor))
+        (constants (copy-label-table (routine-stack-descriptor-constants descriptor))))
+    (dolist (form (routine-stack-descriptor-body descriptor))
+      (when (consp form)
+        (case (token-keyword (first form))
+          (:const
+           (destructuring-bind (_ name value) form
+             (declare (ignore _))
+             (setf (gethash name constants)
+                   (stack-analysis-resolve-operand constants value))))
+          (:bits
+           (destructuring-bind (_ next-bits) form
+             (declare (ignore _))
+             (setf bits (stack-analysis-resolve-operand constants next-bits))))
+          (:label
+           nil)
+          (:initialize-real-mode
+           (let* ((args (stack-analysis-resolve-operand constants (rest form)))
+                  (segment (or (section-spec-load-segment section) 0))
+                  (stack (getf args :stack #x7C00)))
+             (return
+               (make-stack-root-descriptor
+                :routine (routine-stack-descriptor-name descriptor)
+                :stack-top-linear (+ (* 16 segment) stack)
+                :bits 16
+                :origin-form 'initialize-real-mode))))
+          (:initialize-protected-mode
+           (let* ((args (stack-analysis-resolve-operand constants (rest form)))
+                  (section-base (section-linear-base section))
+                  (stack-linear (getf args :stack-linear))
+                  (stack-top (if stack-linear
+                                 stack-linear
+                                 (+ section-base (getf args :stack #x8000)))))
+             (return
+               (make-stack-root-descriptor
+                :routine (routine-stack-descriptor-name descriptor)
+                :stack-top-linear stack-top
+                :bits 32
+                :origin-form 'initialize-protected-mode))))
+          ;; Only trust the stack root when it is the first operational form.
+          (t
+           (return nil)))))))
+
+(defun stack-root-capacity-bytes (target root)
+  (let* ((top (stack-root-descriptor-stack-top-linear root))
+         (region (find-if (lambda (candidate)
+                            (and (eq (token-keyword (memory-region-type candidate)) :RAM)
+                                 (<= (memory-region-start candidate)
+                                     top
+                                     (1+ (memory-region-end candidate)))))
+                          (machine-descriptor-memory-regions target))))
+    (and region
+         (- top (memory-region-start region)))))
+
+(defun compute-routine-stack-usage (descriptor routine-table cache visiting)
+  (or (gethash (routine-stack-descriptor-name descriptor) cache)
+      (progn
+        (when (member (routine-stack-descriptor-name descriptor) visiting :test #'eq)
+          (error "Recursive or cyclic call graph detected at routine ~S; stack usage is unbounded."
+                 (routine-stack-descriptor-name descriptor)))
+        (let ((usage
+                (labels ((note-max (max depth)
+                           (max max depth))
+                         (call-usage (bits current constants target)
+                           (let* ((width (stack-analysis-word-bytes bits))
+                                  (callee (and target (gethash target routine-table))))
+                             (+ current
+                                width
+                                (if callee
+                                    (compute-routine-stack-usage callee
+                                                                 routine-table
+                                                                 cache
+                                                                 (cons (routine-stack-descriptor-name descriptor)
+                                                                       visiting))
+                                    0))))
+                         (walk-forms (forms current bits constants max-depth)
+                           (dolist (form forms (values current bits constants max-depth nil))
+                             (unless (consp form)
+                               (error "Bootwright DSL forms must be lists, got ~S." form))
+                             (multiple-value-bind (next-current next-bits next-constants next-max stop-p)
+                                 (walk-form form current bits constants max-depth)
+                               (setf current next-current
+                                     bits next-bits
+                                     constants next-constants
+                                     max-depth next-max)
+                               (when stop-p
+                                 (return (values current bits constants max-depth t))))))
+                         (walk-form (form current bits constants max-depth)
+                           (case (token-keyword (first form))
+                             (:const
+                              (destructuring-bind (_ name value) form
+                                (declare (ignore _))
+                                (setf (gethash name constants)
+                                      (stack-analysis-resolve-operand constants value))
+                                (values current bits constants max-depth nil)))
+                             (:bits
+                              (destructuring-bind (_ next-bits) form
+                                (declare (ignore _))
+                                (values current
+                                        (stack-analysis-resolve-operand constants next-bits)
+                                        constants
+                                        max-depth
+                                        nil)))
+                             (:repeat
+                              (destructuring-bind (_ count &body repeated-body) form
+                                (declare (ignore _))
+                                (let ((count (stack-analysis-resolve-operand constants count))
+                                      (stopped nil))
+                                  (unless (and (integerp count) (not (minusp count)))
+                                    (error "REPEAT requires a non-negative integer count, got ~S." count))
+                                  (loop repeat count
+                                        do (multiple-value-setq (current bits constants max-depth stopped)
+                                             (walk-forms repeated-body current bits constants max-depth))
+                                           (when stopped
+                                             (return)))
+                                  (values current bits constants max-depth stopped))))
+                             (:routine
+                              (values current bits constants max-depth nil))
+                             (:irq-handler
+                              (let* ((args (stack-analysis-resolve-operand constants (rest form)))
+                                     (target (stack-analysis-direct-call-target constants (second args))))
+                                (values current
+                                        bits
+                                        constants
+                                        (note-max max-depth (call-usage bits current constants target))
+                                        t)))
+                             (:privilege-drop
+                              (values current
+                                      bits
+                                      constants
+                                      (note-max max-depth (+ current 20))
+                                      t))
+                             (t
+                              (let ((op (token-keyword (first form))))
+                                (case op
+                                  (:push
+                                   (let* ((depth (+ current (stack-analysis-word-bytes bits)))
+                                          (next-max (note-max max-depth depth)))
+                                     (values depth bits constants next-max nil)))
+                                  (:pop
+                                   (values (stack-analysis-clamp-depth
+                                            (- current (stack-analysis-word-bytes bits)))
+                                           bits constants max-depth nil))
+                                  (:pushf
+                                   (let* ((depth (+ current (stack-analysis-word-bytes bits)))
+                                          (next-max (note-max max-depth depth)))
+                                     (values depth bits constants next-max nil)))
+                                  (:popf
+                                   (values (stack-analysis-clamp-depth
+                                            (- current (stack-analysis-word-bytes bits)))
+                                           bits constants max-depth nil))
+                                  (:pushfd
+                                   (let* ((depth (+ current 4))
+                                          (next-max (note-max max-depth depth)))
+                                     (values depth bits constants next-max nil)))
+                                  (:popfd
+                                   (values (stack-analysis-clamp-depth (- current 4))
+                                           bits constants max-depth nil))
+                                  (:pusha
+                                   (let* ((depth (+ current 16))
+                                          (next-max (note-max max-depth depth)))
+                                     (values depth bits constants next-max nil)))
+                                  (:popa
+                                   (values (stack-analysis-clamp-depth (- current 16))
+                                           bits constants max-depth nil))
+                                  (:pushad
+                                   (let* ((depth (+ current 32))
+                                          (next-max (note-max max-depth depth)))
+                                     (values depth bits constants next-max nil)))
+                                  (:popad
+                                   (values (stack-analysis-clamp-depth (- current 32))
+                                           bits constants max-depth nil))
+                                  (:call
+                                   (let* ((target (stack-analysis-direct-call-target
+                                                   constants
+                                                   (second form)))
+                                          (next-max (note-max max-depth
+                                                              (call-usage bits current constants target))))
+                                     (values current bits constants next-max nil)))
+                                  (otherwise
+                                   (if (stack-analysis-helper-call-form-p form)
+                                       (values current
+                                               bits
+                                               constants
+                                               (note-max max-depth
+                                                         (+ current (stack-analysis-word-bytes bits)))
+                                               (stack-analysis-terminal-form-p form))
+                                       (values current
+                                               bits
+                                               constants
+                                               max-depth
+                                               (stack-analysis-terminal-form-p form))))))))))
+                  (nth-value 3
+                             (walk-forms (routine-stack-descriptor-body descriptor)
+                                         0
+                                         (routine-stack-descriptor-initial-bits descriptor)
+                                         (copy-label-table
+                                          (routine-stack-descriptor-constants descriptor))
+                                         0)))))
+          (setf (gethash (routine-stack-descriptor-name descriptor) cache) usage)
+          usage))))
+
+(defun assert-section-stack-budget (section target)
+  (let* ((routines (collect-section-routines-for-stack-analysis (section-spec-body section)))
+         (routine-table (build-routine-stack-table routines))
+         (entry (section-spec-entry section))
+         (entry-routine (and entry (gethash entry routine-table))))
+    (when entry-routine
+      (let ((root (infer-routine-initial-stack-root section entry-routine)))
+        (when root
+          (let ((capacity (stack-root-capacity-bytes target root)))
+            (when capacity
+              (let ((usage (compute-routine-stack-usage entry-routine
+                                                        routine-table
+                                                        (make-hash-table :test 'eq)
+                                                        '())))
+                (when (> usage capacity)
+                  (error "Routine ~S requires ~D bytes of stack, but ~S only provides ~D bytes."
+                         (stack-root-descriptor-routine root)
+                         usage
+                         (stack-root-descriptor-origin-form root)
+                         capacity))))))))))
 
 (defun emit-keyboard-read (environment args)
   (require-bits environment 32 "KEYBOARD-READ")
@@ -2929,6 +3759,8 @@ volume's runtime START-LBA cell."
        (emit-gdt environment form))
       (:idt
        (emit-idt environment form))
+      (:page-structures
+       (emit-page-structures environment form))
       (:page-table
        (emit-page-table environment form))
       (:page-directory
@@ -2982,6 +3814,12 @@ volume's runtime START-LBA cell."
          (emit-framebuffer-box environment
                                (resolve-operand environment framebuffer-designator)
                                (resolve-operands environment args))))
+      (:framebuffer-scroll
+       (destructuring-bind (_ framebuffer-designator &rest args) form
+         (declare (ignore _))
+         (emit-framebuffer-scroll environment
+                                  (resolve-operand environment framebuffer-designator)
+                                  (resolve-operands environment args))))
       (:vga-print-hex
        (destructuring-bind (_ value-designator &rest args) form
          (declare (ignore _))
@@ -3008,6 +3846,8 @@ volume's runtime START-LBA cell."
        (emit-uart-write-byte environment (rest form)))
       (:uart-read-byte
        (emit-uart-read-byte environment (rest form)))
+      (:uart-tx-ready-p
+       (emit-uart-tx-ready-p environment (rest form)))
       (:uart-print
        (emit-uart-print environment (rest form)))
       (:pc-speaker-tone
@@ -3068,6 +3908,8 @@ volume's runtime START-LBA cell."
        (emit-irq-unmask environment (rest form)))
       (:irq-end-of-interrupt
        (emit-irq-end-of-interrupt environment (rest form)))
+      (:irq-handler
+       (emit-irq-handler environment (rest form)))
       (:timer-set-frequency
        (emit-timer-set-frequency environment (rest form)))
       (:timer-enable
@@ -3111,6 +3953,8 @@ volume's runtime START-LBA cell."
        (emit-memory-map-base environment (rest form)))
       (:memory-map-count
        (emit-memory-map-count environment (rest form)))
+      (:memory-map-iterate
+       (emit-memory-map-iterate environment (rest form)))
       (:phys-allocator-bootstrap
        (emit-phys-allocator-bootstrap environment form))
       (:phys-allocator-init
@@ -3119,6 +3963,10 @@ volume's runtime START-LBA cell."
        (emit-phys-alloc environment (rest form)))
       (:phys-free
        (emit-phys-free environment (rest form)))
+      (:map-page
+       (emit-map-page environment (rest form)))
+      (:unmap-page
+       (emit-unmap-page environment (rest form)))
       (:execution-slot-type
        (emit-execution-slot-type environment form))
       (:execution-slot
@@ -3148,9 +3996,12 @@ volume's runtime START-LBA cell."
          (declare (ignore _))
          (emit-jump-section environment section-name)))
       (t
-       (encode-instruction state
-                           (first form)
-                           (resolve-operands environment (rest form)))))))
+       (let ((personality-form (lookup-active-personality-form (first form))))
+         (if personality-form
+             (funcall personality-form environment form)
+             (encode-instruction state
+                                 (first form)
+                                 (resolve-operands environment (rest form)))))))))
 
 (defun compile-section-spec (section target layouts)
   (let* ((origin (section-origin section))
@@ -3168,11 +4019,13 @@ volume's runtime START-LBA cell."
         :block-devices (make-hash-table :test 'eq)
         :memory-maps (make-hash-table :test 'eq)
         :phys-allocators (make-hash-table :test 'eq)
+        :page-structures (make-hash-table :test 'eq)
         :syscall-tables (make-hash-table :test 'eq)
         :slot-types (make-hash-table :test 'eq)
         :partition-tables (make-hash-table :test 'eq)
         :volumes (make-hash-table :test 'eq))))
     (pre-scan-section environment (section-spec-body section))
+    (assert-section-stack-budget section target)
     (dolist (form (section-spec-body section))
       (compile-form environment form))
     (emit-required-helpers environment)
@@ -3198,6 +4051,7 @@ volume's runtime START-LBA cell."
        (make-image-spec :name ',name
                         :target ',target
                         :sections ',sections
+                        :personalities (take-pending-personalities)
                         :source-pathname ,(or *load-truename*
                                               *load-pathname*
                                               *compile-file-truename*)))))

@@ -88,6 +88,8 @@
       (pop eax)
       (hang))
     (routine timer-interrupt
+      (irq-handler 0 timer-interrupt-service))
+    (routine timer-interrupt-service
       (push eax)
       (push edi)
       (inc ebx)
@@ -116,9 +118,8 @@
       (call render-time)
       (debug-print second-debug)
       (label timer-eoi)
-      (irq-end-of-interrupt 0)
       (pop edi)
       (pop eax)
-      (iret))
+      (ret))
     (idt idt (:pointer idt-descriptor :selector #x08 :default default-interrupt)
       (:entry #x20 timer-interrupt))))

@@ -1,0 +1,68 @@
+;;;; Bootwright paging-structure demo.
+;;;;
+;;;; Exercises: PAGE-STRUCTURES, MAP-PAGE, UNMAP-PAGE, ENABLE-PAGING.
+;;;; A 4 KiB-page directory/table pair is emitted at the start of the
+;;;; kernel section, paging is enabled, then a spare virtual page at
+;;;; 0x003FF000 is remapped onto VGA text memory and used to write "PG"
+;;;; through the alias mapping.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *paging-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading paging demo
+")
+      (bios-print "Bootwright stage 1: loading paging demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (page-structures kernel-paging
+      (:levels 2
+       :granularity :4kb
+       :base-address #x10000
+       :coverage #x00000000 #x003FFFFF
+       :flags (:present :writable)))
+    (const protected-stack #x90000)
+    (const alias-vga-page-linear #x003FF000)
+    (const alias-vga-page-offset #x003EF000)
+    (const alias-vga-next-cell   #x003EF002)
+    (string debug-ready   "kernel: paging demo reached
+")
+    (string debug-enabled "kernel: paging enabled via page-structures
+")
+    (string debug-remap   "kernel: alias page remapped
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry paging-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine paging-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (cli)
+      (debug-print debug-ready)
+      (enable-paging :page-directory kernel-paging)
+      (debug-print debug-enabled)
+      (unmap-page kernel-paging :virtual alias-vga-page-linear)
+      (map-page kernel-paging
+        :virtual alias-vga-page-linear
+        :physical #x000B8000
+        :flags (:present :writable))
+      (tlb-flush-page alias-vga-page-linear)
+      (mov (:mem :word alias-vga-page-offset) #x1F50)
+      (mov (:mem :word alias-vga-next-cell)   #x1F47)
+      (debug-print debug-remap)
+      (idle-forever))))

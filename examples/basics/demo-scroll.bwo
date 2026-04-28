@@ -1,0 +1,64 @@
+;;;; Bootwright framebuffer scroll demo.
+;;;;
+;;;; Exercises FRAMEBUFFER-SCROLL by filling the bottom three rows,
+;;;; scrolling twice, and then writing the next line into the cleared row.
+(use-machine #P"../../machines/pc-bios.bwm")
+
+(defos *scroll-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading scroll demo
+")
+      (bios-print "Bootwright stage 1: loading scroll demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string enter-pmode-banner "Stage 1 ok. Entering protected mode...")
+    (string title-line "Bootwright framebuffer-scroll demo")
+    (string help-line  "After two scrolls the bottom lines are 03 / 04 / 05.")
+    (string row-01 "line 01")
+    (string row-02 "line 02")
+    (string row-03 "line 03")
+    (string row-04 "line 04")
+    (string row-05 "line 05")
+    (string debug-ready "kernel: scroll demo reached
+")
+    (string debug-pass  "kernel: framebuffer-scroll ok
+")
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print enter-pmode-banner)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry scroll-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine scroll-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (debug-print debug-ready)
+      (framebuffer-print-at screen0 title-line :row 0 :column 2 :attribute #x1F)
+      (framebuffer-print-at screen0 help-line  :row 2 :column 2 :attribute #x2E)
+      (framebuffer-print-at screen0 row-01 :row 22 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 row-02 :row 23 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 row-03 :row 24 :column 2 :attribute #x1A)
+      (framebuffer-scroll screen0 :lines 1 :attribute #x17)
+      (framebuffer-print-at screen0 row-04 :row 24 :column 2 :attribute #x2F)
+      (framebuffer-scroll screen0 :lines 1 :attribute #x17)
+      (framebuffer-print-at screen0 row-05 :row 24 :column 2 :attribute #x4F)
+      (framebuffer-print-at screen0 title-line :row 0 :column 2 :attribute #x1F)
+      (framebuffer-print-at screen0 help-line  :row 1 :column 2 :attribute #x2E)
+      (debug-print debug-pass)
+      (idle-forever))))

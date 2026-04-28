@@ -10,5 +10,6 @@
                (:file "src/machine")
                (:file "src/dsl")
                (:file "src/image")
+               (:file "src/personality")
                (:file "src/source")
                (:file "src/testing")))

@@ -2,9 +2,9 @@
 ;;;;
 ;;;; Declares a memory-map descriptor backed by INT 15h E820, runs the
 ;;;; probe in the kernel's real-mode entry routine, then switches to
-;;;; protected mode and renders the entry count plus the base address of
-;;;; the first reported region.  Asserts that QEMU's BIOS returned at
-;;;; least one E820 entry.
+;;;; protected mode and renders the total entry count plus an
+;;;; MEMORY-MAP-ITERATE summary of available regions. Asserts that
+;;;; QEMU's BIOS returned at least one E820 entry.
 (use-machine #P"../../machines/pc-bios.bwm")
 
 (defos *memmap-demo* (:machine pc-bios)
@@ -27,10 +27,9 @@
     (const protected-stack #x90000)
     (string banner-pmode "Stage 1 ok. Probing E820 then entering pmode...")
     (string label-count  "E820 entries   :")
-    (string label-base0  "First base.lo  :")
-    (string label-len0   "First len.lo   :")
-    (string label-type0  "First type     :")
-    (string label-help   "INT 15h E820 probe ran in real mode before pmode.")
+    (string label-avail  "Avail regions  :")
+    (string label-max    "Largest len.lo :")
+    (string label-help   "MEMORY-MAP-ITERATE walks only usable E820 ranges.")
     (string debug-ready  "kernel: memmap demo reached
 ")
     (string debug-pass   "kernel: e820 ok
@@ -56,9 +55,8 @@
                                 :attribute #x1E
                                 :title "Bootwright E820 memory map")
       (framebuffer-print-at screen0 label-count :row 2 :column 2 :attribute #x1A)
-      (framebuffer-print-at screen0 label-base0 :row 3 :column 2 :attribute #x1A)
-      (framebuffer-print-at screen0 label-len0  :row 4 :column 2 :attribute #x1A)
-      (framebuffer-print-at screen0 label-type0 :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-avail :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-max   :row 4 :column 2 :attribute #x1A)
       (framebuffer-print-at screen0 label-help  :row 7 :column 2 :attribute #x2E)
       (debug-print debug-ready)
       ;; Entry count.
@@ -66,14 +64,23 @@
       (test eax eax)
       (jz-near memmap-fail)
       (vga-print-decimal eax :row 2 :column 22 :attribute #x4F)
-      ;; First entry: base.lo, length.lo, type.lo.
-      (memory-map-base esi phys-map)
-      (mov eax (:mem :dword esi 0))
-      (vga-print-hex eax :row 3 :column 22 :attribute #x2F)
-      (mov eax (:mem :dword esi 8))
+      ;; Iterate only available regions and keep the largest low 32-bit span.
+      (xor edx edx)
+      (xor ebx ebx)
+      (memory-map-iterate phys-map
+        :type :available
+        :base-reg esi
+        :length-reg ecx
+        :body
+          (inc edx)
+          (cmp ecx ebx)
+          (jbe-near memmap-next)
+          (mov ebx ecx)
+          (label memmap-next))
+      (mov eax edx)
+      (vga-print-decimal eax :row 3 :column 22 :attribute #x2F)
+      (mov eax ebx)
       (vga-print-hex eax :row 4 :column 22 :attribute #x2F)
-      (mov eax (:mem :dword esi 16))
-      (vga-print-hex eax :row 5 :column 22 :attribute #x2F)
       (debug-print debug-pass)
       (idle-forever)
       (label memmap-fail)

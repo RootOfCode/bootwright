@@ -68,11 +68,12 @@
   serial-devices
   framebuffer-devices)
 
-(defstruct (image-spec (:constructor make-image-spec (&key name target sections source-pathname)))
+(defstruct (image-spec (:constructor make-image-spec (&key name target sections source-pathname personalities)))
   name
   target
   sections
-  source-pathname)
+  source-pathname
+  personalities)
 
 (defstruct (section-spec
             (:constructor make-section-spec
@@ -266,7 +267,10 @@
                                               (boot-protocol-sector-size protocol))
                           :source-root source-root)))
     (t
-     (error "Unknown section form ~S." (first form))))))
+     (let ((handler (lookup-active-personality-section-type (first form))))
+       (if handler
+           (funcall handler form target source-root)
+           (error "Unknown section form ~S." (first form))))))))
 
 (defun parse-sections (section-forms target &optional source-root)
   (mapcar (lambda (form) (parse-section-form form target source-root))

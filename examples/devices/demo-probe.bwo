@@ -60,6 +60,12 @@
                                 :attribute #x1E
                                 :title "Bootwright system probe")
       (uart-init com1)
+      (label serial-prompt-wait)
+      (uart-tx-ready-p com1 serial-prompt-send)
+      (jmp serial-prompt-wait)
+      (label serial-prompt-send)
+      (mov al #x3E)
+      (uart-write-byte com1 al)
       (uart-print com1 serial-online)
       (framebuffer-print-at screen0 label-cr0    :row 3 :column 2 :attribute #x1A)
       (framebuffer-print-at screen0 label-magic  :row 4 :column 2 :attribute #x1A)
@@ -89,6 +95,8 @@
       (hlt)
       (jmp idle-loop))
     (routine timer-interrupt
+      (irq-handler 0 timer-interrupt-service))
+    (routine timer-interrupt-service
       ;; EBX and ECX persist across handler calls and are not pushed.
       (push eax)
       (push edx)
@@ -107,12 +115,11 @@
       (mov ecx 20)
       (uart-print com1 serial-tick)
       (label tick-done)
-      (irq-end-of-interrupt 0)
       (pop esi)
       (pop edi)
       (pop edx)
       (pop eax)
-      (iret))
+      (ret))
     (routine default-interrupt
       (push eax)
       (debug-print "probe: unexpected interrupt

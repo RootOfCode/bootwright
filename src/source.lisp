@@ -42,7 +42,8 @@
          (target-package (or (find-package package)
                              (error "Unknown package ~S for Bootwright source loading." package)))
          (*package* target-package)
-         (*loaded-os-images* '()))
+         (*loaded-os-images* '())
+         (*pending-personalities* '()))
     (load source :verbose nil :print nil)
     (let ((images (nreverse *loaded-os-images*)))
       (unless images

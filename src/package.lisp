@@ -41,7 +41,15 @@
    #:section-layout-load-segment
    #:section-layout-load-offset
    #:section-layout-origin
-   #:section-layout-entry-offset))
+   #:section-layout-entry-offset
+   #:defpersonality
+   #:defroutine-form
+   #:defdata-form
+   #:defsection-type
+   #:use-personality
+   #:load-personality-file
+   #:build-personality-file
+   #:find-personality))
 
 (defpackage #:bootwright.os
   (:use #:cl #:bootwright))
@@ -49,4 +57,12 @@
 (defpackage #:bootwright.machine
   (:use #:cl #:bootwright))
 
+(defpackage #:bootwright.personality
+  (:use #:cl #:bootwright))
+
 (in-package #:bootwright)
+
+(declaim (special *active-personalities*
+                  *pending-personalities*
+                  *loaded-personalities*
+                  *current-personality*))

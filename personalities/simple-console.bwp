@@ -1,0 +1,61 @@
+;;;; Bootwright sample personality.
+;;;;
+;;;; Demonstrates all three personality extension hooks:
+;;;; - DEFSECTION-TYPE: PERSONALITY-KERNEL
+;;;; - DEFDATA-FORM:    PANEL-STRING
+;;;; - DEFROUTINE-FORM: PANEL-BOX / PANEL-LINE
+
+(defpersonality simple-console
+  ((:version "0.1")
+   (:description "Small console-oriented personality used to exercise Bootwright phase 7.")
+   (:requires-phases :machine-description :framebuffer :protected-mode)
+   (:compatible-isa :x86-32))
+
+  (defsection-type personality-kernel
+      (name (&key entry load-segment (load-offset 0) origin sector-align) &body body)
+    (let* ((protocol (bootwright::machine-descriptor-boot-protocol target))
+           (resolved-load-segment (or load-segment
+                                      (bootwright::boot-protocol-kernel-segment protocol)))
+           (resolved-sector-align (or sector-align
+                                      (bootwright::boot-protocol-sector-size protocol))))
+      (bootwright::make-section-spec :name name
+                                     :kind :kernel
+                                     :body body
+                                     :entry entry
+                                     :load-segment resolved-load-segment
+                                     :load-offset load-offset
+                                     :origin origin
+                                     :sector-align resolved-sector-align
+                                     :source-root source-root)))
+
+  (defdata-form panel-string
+      (name (&key text align zero-terminated))
+    (bootwright::compile-form
+     environment
+     `(string ,name ,text
+              ,@(when align `(:align ,align))
+              ,@(when (not (null zero-terminated))
+                  `(:zero-terminated ,zero-terminated)))))
+
+  (defroutine-form panel-box
+      ((&key screen title row column width height attribute) &body _)
+    (declare (ignore _))
+    (bootwright::compile-form
+     environment
+     `(framebuffer-box ,screen
+                       :title ,title
+                       :row ,row
+                       :column ,column
+                       :width ,width
+                       :height ,height
+                       :attribute ,attribute)))
+
+  (defroutine-form panel-line
+      ((&key screen text row column attribute) &body _)
+    (declare (ignore _))
+    (bootwright::compile-form
+     environment
+     `(framebuffer-print-at ,screen ,text
+                            :row ,row
+                            :column ,column
+                            :attribute ,attribute))))

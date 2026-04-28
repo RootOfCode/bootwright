@@ -1,0 +1,62 @@
+;;;; Bootwright personality demo.
+;;;;
+;;;; Loads a .bwp personality file and uses its custom section type,
+;;;; data form, and routine forms to render a small status panel.
+(use-machine #P"../../machines/pc-bios.bwm")
+(use-personality #P"../../personalities/simple-console.bwp")
+
+(defos *personality-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading personality demo
+")
+      (bios-print "Bootwright stage 1: loading personality demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+  (personality-kernel kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (panel-string banner      (:text "Stage 1 ok. Entering protected mode..."))
+    (panel-string body-line-1 (:text "Section type came from .bwp"))
+    (panel-string body-line-2 (:text "Routine/data forms came from .bwp"))
+    (panel-string body-line-3 (:text "Personality path is active during build"))
+    (panel-string status-line (:text "PASS"))
+    (panel-string debug-ready (:text "kernel: personality demo reached
+"))
+    (panel-string debug-pass  (:text "kernel: personality forms ok
+"))
+    (gdt gdt (:pointer gdt-descriptor)
+      (:null)
+      (:code32 :base :section :limit #xAFFFF)
+      (:data32 :base :section :limit #xAFFFF))
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry personality-main
+                            :code-selector #x08))
+    (bits 32)
+    (routine personality-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (debug-print debug-ready)
+      (panel-box (:screen screen0
+                 :title "Bootwright personality demo"
+                 :row 0
+                 :column 0
+                 :width 60
+                 :height 8
+                 :attribute #x1E))
+      (panel-line (:screen screen0 :text body-line-1 :row 2 :column 2 :attribute #x1A))
+      (panel-line (:screen screen0 :text body-line-2 :row 3 :column 2 :attribute #x1A))
+      (panel-line (:screen screen0 :text body-line-3 :row 4 :column 2 :attribute #x2E))
+      (panel-line (:screen screen0 :text status-line :row 6 :column 2 :attribute #x2F))
+      (debug-print debug-pass)
+      (idle-forever))))

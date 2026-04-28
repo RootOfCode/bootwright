@@ -29,6 +29,48 @@
       (append-padded-section buffer (compiled-section-bytes compiled) protocol))
     buffer))
 
+(defun section-has-runtime-placement-p (section)
+  (or (section-spec-load-segment section)
+      (section-spec-origin section)
+      (eq (section-spec-kind section) :boot)))
+
+(defun compiled-section-runtime-range (compiled)
+  (let ((spec (compiled-section-spec compiled)))
+    (when (section-has-runtime-placement-p spec)
+      (let* ((start (section-linear-base spec))
+             (end (+ start (max 0 (1- (length (compiled-section-bytes compiled)))))))
+        (values start end spec)))))
+
+(defun assert-non-overlapping-section-loads (compiled-sections)
+  (let ((placements
+          (sort
+           (loop for compiled in compiled-sections
+                 for (values start end spec) = (multiple-value-list
+                                                (compiled-section-runtime-range compiled))
+                 when spec
+                   collect (list :compiled compiled
+                                 :spec spec
+                                 :start start
+                                 :end end))
+           #'<
+           :key (lambda (entry) (getf entry :start)))))
+    (loop for (left right) on placements
+          while right
+          do (when (<= (getf right :start) (getf left :end))
+               (let* ((left-spec (getf left :spec))
+                      (right-spec (getf right :spec))
+                      (left-start (getf left :start))
+                      (left-end (getf left :end))
+                      (right-start (getf right :start))
+                      (right-end (getf right :end)))
+                 (error "Sections ~S and ~S overlap in runtime memory: ~X-~X overlaps ~X-~X."
+                        (section-spec-name left-spec)
+                        (section-spec-name right-spec)
+                        left-start
+                        left-end
+                        right-start
+                        right-end))))))
+
 (defun compute-layouts (compiled-sections protocol)
   (let ((current-lba 1)
         (sector-size (boot-protocol-sector-size protocol)))
@@ -78,6 +120,8 @@
          (protocol (machine-descriptor-boot-protocol target))
          (source-root (and (image-spec-source-pathname spec)
                            (pathname-directory-pathname (image-spec-source-pathname spec))))
+         (*active-personalities*
+          (resolve-active-personalities (image-spec-personalities spec)))
          (sections (parse-sections (image-spec-sections spec) target source-root))
          (boot (find :boot sections :key #'section-spec-kind))
          (payload (remove :boot sections :key #'section-spec-kind)))
@@ -89,6 +133,7 @@
            (layouts (compute-layouts compiled-payload protocol))
            (compiled-boot (compile-section-spec boot target layouts))
            (buffer (finalize-image protocol compiled-boot compiled-payload)))
+      (assert-non-overlapping-section-loads (cons compiled-boot compiled-payload))
       (make-compiled-image :name (image-spec-name spec)
                            :target target
                            :bytes buffer
