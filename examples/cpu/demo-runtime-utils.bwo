@@ -1,0 +1,130 @@
+;;;; Bootwright runtime utility demo.
+;;;;
+;;;; Exercises the new storage and runtime helper forms:
+;;;;   * RESB / RESD
+;;;;   * COPY-STRING / STRING-LENGTH / STRING-EQUAL
+;;;;   * FILL-MEMORY / ZERO-MEMORY / COPY-MEMORY / COMPARE-MEMORY
+;;;;   * label-rooted (:mem ...) forms like (:mem :byte buffer 7)
+;;;;     and (:mem :dword table ecx 4 0)
+(use-machine #P"../../machines/pc-bios.bwm")
+(include "lib/gdt-flat.bwo")
+
+(defos *runtime-utils-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading runtime utils demo
+")
+      (bios-print "Bootwright stage 1: loading runtime utils demo...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    (const protected-stack #x90000)
+    (string banner-pmode "Stage 1 ok. Entering runtime helper demo...")
+    (string debug-ready "kernel: runtime utils reached
+")
+    (string debug-pass "kernel: runtime helpers ok
+")
+    (string debug-fail "kernel: runtime helpers FAILED
+")
+    (string label-length "String length :")
+    (string label-char   "Char @ +7    :")
+    (string label-fill   "Fill dword   :")
+    (string label-zero   "Zero buffer  :")
+    (string label-copy   "Copy compare :")
+    (string label-help   "Uses copy/zero/fill/compare helpers and label-rooted :mem.")
+
+    #.(flat-gdt 'gdt :pointer 'gdt-descriptor)
+
+    (routine kernel-real-entry
+      (initialize-real-mode :stack #x9000)
+      (bios-print banner-pmode)
+      (enter-protected-mode :gdt gdt-descriptor
+                            :entry runtime-main
+                            :code-selector #x08))
+
+    (bits 32)
+
+    (routine runtime-main
+      (initialize-protected-mode :data-selector #x10 :stack-linear protected-stack)
+      (framebuffer-clear screen0 :attribute #x17)
+      (framebuffer-box screen0 :row 0 :column 0 :width 66 :height 10
+                                :attribute #x1E
+                                :title "Bootwright runtime helpers")
+      (framebuffer-print-at screen0 label-length :row 2 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-char   :row 3 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-fill   :row 4 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-zero   :row 5 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-copy   :row 6 :column 2 :attribute #x1A)
+      (framebuffer-print-at screen0 label-help   :row 8 :column 2 :attribute #x2E)
+      (debug-print debug-ready)
+
+      (zero-memory runtime-buffer 32)
+      (copy-string runtime-buffer source-text)
+      (string-length runtime-buffer eax)
+      (cmp eax 16)
+      (jne-near runtime-fail)
+      (vga-print-decimal eax :row 2 :column 18 :attribute #x4F)
+
+      (string-equal runtime-buffer source-text
+                    :equal strings-match
+                    :not-equal runtime-fail)
+
+      (label strings-match)
+      (movzx esi (:mem :byte runtime-buffer 7))
+      (cmp esi #x6B)
+      (jne-near runtime-fail)
+      (vga-print-hex esi :row 3 :column 18 :attribute #x2F)
+
+      (fill-memory pattern-buffer #x11223344 4 :unit :dword)
+      (mov ecx 2)
+      (mov ebx (:mem :dword pattern-buffer ecx 4 0))
+      (cmp ebx #x11223344)
+      (jne-near runtime-fail)
+      (vga-print-hex ebx :row 4 :column 18 :attribute #x2F)
+
+      (zero-memory zero-buffer 16)
+      (mov edx (:mem :dword zero-buffer))
+      (cmp edx 0)
+      (jne-near runtime-fail)
+      (vga-print-hex edx :row 5 :column 18 :attribute #x2F)
+
+      (copy-memory mirror-buffer pattern-buffer 4 :unit :dword)
+      (compare-memory mirror-buffer pattern-buffer 4
+                      :unit :dword
+                      :equal copy-ok
+                      :not-equal runtime-fail)
+
+      (label copy-ok)
+      (compare-memory runtime-buffer source-text 4
+                      :unit :dword
+                      :equal runtime-pass
+                      :not-equal runtime-fail)
+
+      (label runtime-pass)
+      (vga-print screen0-ok :row 6 :column 18 :attribute #x2F)
+      (debug-print debug-pass)
+      (idle-forever)
+
+      (label runtime-fail)
+      (debug-print debug-fail)
+      (hang))
+
+    (string source-text "lambda-kernel-ok")
+    (string screen0-ok  "OK")
+    (label runtime-buffer)
+    (resb 32)
+    (label pattern-buffer)
+    (resd 4)
+    (label mirror-buffer)
+    (resd 4)
+    (label zero-buffer)
+    (resb 16)))

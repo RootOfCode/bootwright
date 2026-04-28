@@ -14,11 +14,24 @@
            (encode (state op operands)
              (funcall (symbol-function (find-symbol "ENCODE-INSTRUCTION" "BOOTWRIGHT"))
                       state op operands))
+           (emit-label-at (state name)
+             (funcall (symbol-function (find-symbol "EMIT-LABEL" "BOOTWRIGHT"))
+                      state name))
+           (final-bytes (state)
+             (multiple-value-bind (bytes labels)
+                 (funcall (symbol-function (find-symbol "FINALIZE-ASSEMBLY" "BOOTWRIGHT"))
+                          state)
+               (declare (ignore labels))
+               bytes))
            (state-bytes (state)
              (funcall (symbol-function (find-symbol "ASSEMBLY-STATE-BYTES" "BOOTWRIGHT"))
                       state))
            (assert-bytes (state expected label)
              (let ((actual (coerce (state-bytes state) 'list)))
+               (unless (equal actual expected)
+                 (error "Phase 1 ~A failed: expected ~S got ~S." label expected actual))))
+           (assert-final-bytes (state expected label)
+             (let ((actual (coerce (final-bytes state) 'list)))
                (unless (equal actual expected)
                  (error "Phase 1 ~A failed: expected ~S got ~S." label expected actual)))))
     ;; x86-64
@@ -44,6 +57,28 @@
       (encode s 'sysret '())
       (encode s 'ret '())
       (assert-bytes s '(#x0F #x05 #x0F #x07 #xC3) "x86-64 syscall; sysret; ret"))
+    ;; x86-32
+    (let ((s (make-state :x86-32)))
+      (emit-label-at s 'slot)
+      (encode s 'mov '(eax (:mem :dword slot)))
+      (assert-final-bytes s '(#x8B #x05 #x00 #x00 #x00 #x00)
+                          "x86-32 MOV eax, [slot]"))
+    (let ((s (make-state :x86-32)))
+      (emit-label-at s 'slot)
+      (encode s 'mov '(eax (:mem :dword slot 4)))
+      (assert-final-bytes s '(#x8B #x05 #x04 #x00 #x00 #x00)
+                          "x86-32 MOV eax, [slot+4]"))
+    (let ((s (make-state :x86-32)))
+      (emit-label-at s 'table)
+      (encode s 'mov '(eax (:mem :dword table ecx 4 8)))
+      (assert-final-bytes s '(#x8B #x04 #x8D #x08 #x00 #x00 #x00)
+                          "x86-32 MOV eax, [table + ecx*4 + 8]"))
+    (let ((s (make-state :x86-32)))
+      (encode s 'rep '(movsb))
+      (encode s 'repe '(cmpsb))
+      (encode s 'repne '(scasb))
+      (assert-bytes s '(#xF3 #xA4 #xF3 #xA6 #xF2 #xAE)
+                    "x86-32 REP MOVSB; REPE CMPSB; REPNE SCASB"))
     ;; AArch64 stub
     (let ((s (make-state :aarch64)))
       (encode s 'nop '())
@@ -151,6 +186,10 @@
                  :expect-debugcon '("stage1: loading personality demo"
                                     "kernel: personality demo reached"
                                     "kernel: personality forms ok"))
+    (test-source "examples/lisp-os/demo-lisp-os.bwo"
+                 :timeout-ms 3000
+                 :expect-debugcon '("stage1: loading lisp os demo"
+                                    "kernel: lisp os ready"))
     (test-source "examples/devices/demo-timer.bwo"
                  :timeout-ms 5000
                  :expect-debugcon '("stage1: loading timer demo"
@@ -174,6 +213,11 @@
                  :expect-debugcon '("stage1: loading memory ops demo"
                                     "kernel: memory ops demo reached"
                                     "kernel: memory ops checks passed"))
+    (test-source "examples/cpu/demo-runtime-utils.bwo"
+                 :timeout-ms 5000
+                 :expect-debugcon '("stage1: loading runtime utils demo"
+                                    "kernel: runtime utils reached"
+                                    "kernel: runtime helpers ok"))
     (test-source "examples/cpu/demo-sysinstr.bwo"
                  :timeout-ms 5000
                  :expect-debugcon '("stage1: loading sysinstr demo"

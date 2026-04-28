@@ -1,9 +1,27 @@
 (in-package #:bootwright)
 
+(defparameter +bios-floppy-sectors-per-track+ 18)
+(defparameter +bios-floppy-heads+ 2)
+(defparameter +bios-floppy-cylinders+ 80)
+
 (defun make-zero-padded-copy (bytes total-size)
   (let ((buffer (make-octet-buffer)))
     (append-octets buffer bytes)
     (loop repeat (- total-size (length bytes)) do
+      (append-octet buffer 0))
+    buffer))
+
+(defun pad-bios-floppy-image-buffer (buffer protocol)
+  (let* ((sector-size (boot-protocol-sector-size protocol))
+         (target-size (* sector-size
+                         +bios-floppy-sectors-per-track+
+                         +bios-floppy-heads+
+                         +bios-floppy-cylinders+)))
+    (when (> (length buffer) target-size)
+      (error "Image is ~D bytes, which exceeds the current BIOS floppy geometry budget of ~D bytes."
+             (length buffer)
+             target-size))
+    (loop repeat (- target-size (length buffer)) do
       (append-octet buffer 0))
     buffer))
 
@@ -27,7 +45,7 @@
     (append-octets buffer (finalize-boot-sector compiled-boot protocol))
     (dolist (compiled payload-sections)
       (append-padded-section buffer (compiled-section-bytes compiled) protocol))
-    buffer))
+    (pad-bios-floppy-image-buffer buffer protocol)))
 
 (defun section-has-runtime-placement-p (section)
   (or (section-spec-load-segment section)

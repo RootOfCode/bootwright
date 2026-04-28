@@ -381,39 +381,48 @@ against the address of the next instruction."
            (error "Unsupported 8-bit immediate operand ~S." operand)))))
 
 (defun emit-imm16 (state operand)
+  (emit-imm16-with-addend state operand 0))
+
+(defun emit-imm16-with-addend (state operand addend)
   (let ((normalized (normalize-immediate operand))
         (position (assembly-offset state)))
     (cond ((integerp normalized)
-           (emit-u16 state normalized))
+           (emit-u16 state (+ normalized addend)))
           ((label-reference-p normalized)
            (emit-u16 state 0)
-           (add-fixup state :imm16 (second normalized) position))
+           (add-fixup state :imm16 (second normalized) position addend))
           ((linear-reference-p normalized)
            (emit-u16 state 0)
-           (add-fixup state :imm16-linear (second normalized) position))
+           (add-fixup state :imm16-linear (second normalized) position addend))
           ((low16-reference-p normalized)
            (emit-u16 state 0)
-           (add-fixup state :imm16-low (second normalized) position))
+           (add-fixup state :imm16-low (second normalized) position addend))
           ((high16-reference-p normalized)
            (emit-u16 state 0)
-           (add-fixup state :imm16-high (second normalized) position))
+           (add-fixup state :imm16-high (second normalized) position addend))
           (t
            (error "Unsupported 16-bit immediate operand ~S." operand)))))
 
 (defun emit-imm32 (state operand)
+  (emit-imm32-with-addend state operand 0))
+
+(defun emit-imm32-with-addend (state operand addend)
   (let ((normalized (normalize-immediate operand))
         (position (assembly-offset state)))
     (cond ((integerp normalized)
-           (emit-u32 state normalized))
+           (emit-u32 state (+ normalized addend)))
           ((label-reference-p normalized)
            (emit-u32 state 0)
-           (add-fixup state :imm32 (second normalized) position))
+           (add-fixup state :imm32 (second normalized) position addend))
           ((linear-reference-p normalized)
            (emit-u32 state 0)
-           (add-fixup state :imm32-linear (second normalized) position))
+           (add-fixup state :imm32-linear (second normalized) position addend))
           ((linear-addend-reference-p normalized)
            (emit-u32 state 0)
-           (add-fixup state :imm32-linear (second normalized) position (third normalized)))
+           (add-fixup state :imm32-linear
+                      (second normalized)
+                      position
+                      (+ addend (third normalized))))
           (t
            (error "Unsupported 32-bit immediate operand ~S." operand)))))
 
@@ -546,84 +555,164 @@ against the address of the next instruction."
              operand declared-width width))
     width))
 
+(defun dword-address-designator-p (operand)
+  (let ((normalized (normalize-immediate operand)))
+    (or (integerp normalized)
+        (label-reference-p normalized)
+        (linear-reference-p normalized)
+        (linear-addend-reference-p normalized))))
+
+(defun word-address-designator-p (operand)
+  (let ((normalized (normalize-immediate operand)))
+    (or (integerp normalized)
+        (label-reference-p normalized)
+        (linear-reference-p normalized)
+        (low16-reference-p normalized)
+        (high16-reference-p normalized))))
+
 (defun emit-memory-reference-32 (state reg-field operand)
   (multiple-value-bind (_ parts)
       (parse-memory-operand operand)
     (declare (ignore _))
-    (flet ((base-register-code (designator)
-             (or (dword-register-p designator)
-                 (error "32-bit memory addressing requires a 32-bit base register, got ~S."
-                        designator))))
-      (case (length parts)
-        (1
-         (let ((part (first parts)))
-           (if (dword-register-p part)
-               (let ((base (base-register-code part)))
-                 (cond ((= base 4)
-                        (emit-modrm state 0 reg-field 4)
-                        (emit-sib state 1 4 4))
-                       ((= base 5)
-                        (emit-modrm state 1 reg-field 5)
-                        (emit-signed-u8 state 0))
-                       (t
-                        (emit-modrm state 0 reg-field base))))
-               (progn
-                 (emit-modrm state 0 reg-field 5)
-                 (emit-imm32 state part)))))
-        ((2 4)
-         (let ((base (first parts))
-               (displacement (if (= (length parts) 2)
-                                 (second parts)
-                                 (fourth parts))))
-           (unless (integerp displacement)
-             (error "Memory displacement must be an integer, got ~S." displacement))
-           (if (= (length parts) 2)
+    (labels ((base-register-code (designator)
+               (or (dword-register-p designator)
+                   (error "32-bit memory addressing requires a 32-bit register, got ~S."
+                          designator)))
+             (normalized-integer (designator)
+               (let ((normalized (normalize-immediate designator)))
+                 (and (integerp normalized) normalized)))
+             (scale-valid-p (scale)
+               (member scale '(1 2 4 8)))
+             (zero-displacement-p (designator addend)
+               (let ((value (normalized-integer designator)))
+                 (and value (= (+ value addend) 0))))
+             (signed-u8-displacement-p (designator addend)
+               (let ((value (normalized-integer designator)))
+                 (and value (typep (+ value addend) '(integer -128 127)))))
+             (emit-absolute (designator &optional (addend 0))
+               (unless (dword-address-designator-p designator)
+                 (error "Absolute 32-bit memory addressing requires an integer or label, got ~S."
+                        designator))
+               (emit-modrm state 0 reg-field 5)
+               (emit-imm32-with-addend state designator addend))
+             (emit-base-address (base designator &optional (addend 0))
                (let ((base-code (base-register-code base)))
                  (cond ((and (/= base-code 5)
-                             (typep displacement '(integer -128 127))
-                             (/= displacement 0))
-                        (if (= base-code 4)
-                            (progn
-                              (emit-modrm state 1 reg-field 4)
-                              (emit-sib state 1 4 4))
-                            (emit-modrm state 1 reg-field base-code))
-                        (emit-signed-u8 state displacement))
-                       ((and (/= base-code 5) (= displacement 0))
+                             (zero-displacement-p designator addend))
                         (if (= base-code 4)
                             (progn
                               (emit-modrm state 0 reg-field 4)
                               (emit-sib state 1 4 4))
                             (emit-modrm state 0 reg-field base-code)))
+                       ((and (/= base-code 5)
+                             (signed-u8-displacement-p designator addend))
+                        (if (= base-code 4)
+                            (progn
+                              (emit-modrm state 1 reg-field 4)
+                              (emit-sib state 1 4 4))
+                            (emit-modrm state 1 reg-field base-code))
+                        (emit-signed-u8 state (+ (normalized-integer designator) addend)))
+                       ((and (= base-code 5)
+                             (zero-displacement-p designator addend))
+                        (emit-modrm state 1 reg-field 5)
+                        (emit-signed-u8 state 0))
                        (t
                         (if (= base-code 4)
                             (progn
                               (emit-modrm state 2 reg-field 4)
                               (emit-sib state 1 4 4))
                             (emit-modrm state 2 reg-field base-code))
-                        (emit-signed-u32 state displacement))))
-               (destructuring-bind (base index scale _disp) parts
-                 (declare (ignore _disp))
-                 (let ((base-code (base-register-code base))
-                       (index-code (base-register-code index)))
-                   (when (= index-code 4)
-                     (error "ESP cannot be used as a scaled index in ~S." operand))
-                   (cond ((and (/= base-code 5)
-                               (typep displacement '(integer -128 127))
-                               (/= displacement 0))
-                          (emit-modrm state 1 reg-field 4)
-                          (emit-sib state scale index-code base-code)
-                          (emit-signed-u8 state displacement))
-                         ((and (/= base-code 5) (= displacement 0))
-                          (emit-modrm state 0 reg-field 4)
-                          (emit-sib state scale index-code base-code))
-                         (t
-                          (emit-modrm state (if (typep displacement '(integer -128 127)) 1 2)
-                                      reg-field
-                                      4)
-                          (emit-sib state scale index-code base-code)
-                          (if (typep displacement '(integer -128 127))
-                              (emit-signed-u8 state displacement)
-                              (emit-signed-u32 state displacement)))))))))
+                        (emit-imm32-with-addend state designator addend)))))
+             (emit-base-index-address (base index scale designator &optional (addend 0))
+               (unless (scale-valid-p scale)
+                 (error "Scaled 32-bit memory operands require scale 1, 2, 4, or 8, got ~S."
+                        scale))
+               (let ((index-code (base-register-code index)))
+                 (when (= index-code 4)
+                   (error "ESP cannot be used as a scaled index in ~S." operand))
+                 (if base
+                     (let ((base-code (base-register-code base)))
+                       (cond ((and (/= base-code 5)
+                                   (zero-displacement-p designator addend))
+                              (emit-modrm state 0 reg-field 4)
+                              (emit-sib state scale index-code base-code))
+                             ((and (/= base-code 5)
+                                   (signed-u8-displacement-p designator addend))
+                              (emit-modrm state 1 reg-field 4)
+                              (emit-sib state scale index-code base-code)
+                              (emit-signed-u8 state (+ (normalized-integer designator) addend)))
+                             ((and (= base-code 5)
+                                   (zero-displacement-p designator addend))
+                              (emit-modrm state 1 reg-field 4)
+                              (emit-sib state scale index-code base-code)
+                              (emit-signed-u8 state 0))
+                             (t
+                              (emit-modrm state 2 reg-field 4)
+                              (emit-sib state scale index-code base-code)
+                              (emit-imm32-with-addend state designator addend))))
+                     (progn
+                       (unless (dword-address-designator-p designator)
+                         (error "Indexed absolute memory operands require an integer or label, got ~S."
+                                designator))
+                       (emit-modrm state 0 reg-field 4)
+                       (emit-sib state scale index-code 5)
+                       (emit-imm32-with-addend state designator addend))))))
+      (case (length parts)
+        (1
+         (let ((part (first parts)))
+           (cond ((dword-register-p part)
+                  (emit-base-address part 0))
+                 ((dword-address-designator-p part)
+                  (emit-absolute part))
+                 (t
+                  (error "Unsupported memory operand syntax ~S." operand)))))
+        (2
+         (destructuring-bind (first second) parts
+           (cond ((and (dword-register-p first)
+                       (dword-address-designator-p second))
+                  (emit-base-address first second))
+                 ((and (dword-register-p first) (dword-register-p second))
+                  (emit-base-index-address first second 1 0))
+                 ((and (dword-address-designator-p first)
+                       (integerp (normalized-integer second)))
+                  (emit-absolute first (normalized-integer second)))
+                 ((and (integerp (normalized-integer first))
+                       (dword-address-designator-p second))
+                  (emit-absolute second (normalized-integer first)))
+                 ((and (dword-address-designator-p first) (dword-register-p second))
+                  (emit-base-index-address nil second 1 first))
+                 (t
+                  (error "Unsupported memory operand syntax ~S." operand)))))
+        (3
+         (destructuring-bind (first second third) parts
+           (cond ((and (dword-register-p first)
+                       (dword-register-p second)
+                       (integerp third))
+                  (emit-base-index-address first second third 0))
+                 ((and (dword-address-designator-p first)
+                       (dword-register-p second)
+                       (integerp third))
+                  (emit-base-index-address nil second third first))
+                 ((and (dword-register-p first)
+                       (dword-address-designator-p second)
+                       (integerp (normalized-integer third)))
+                  (emit-base-address first second (normalized-integer third)))
+                 (t
+                  (error "Unsupported memory operand syntax ~S." operand)))))
+        (4
+         (destructuring-bind (first second third fourth) parts
+           (cond ((and (dword-register-p first)
+                       (dword-register-p second)
+                       (integerp third)
+                       (dword-address-designator-p fourth))
+                  (emit-base-index-address first second third fourth))
+                 ((and (dword-address-designator-p first)
+                       (dword-register-p second)
+                       (integerp third)
+                       (integerp (normalized-integer fourth)))
+                  (emit-base-index-address nil second third first (normalized-integer fourth)))
+                 (t
+                  (error "Unsupported memory operand syntax ~S." operand)))))
         (t
          (error "Unsupported memory operand syntax ~S." operand))))))
 
@@ -640,11 +729,29 @@ against the address of the next instruction."
             (multiple-value-bind (_ parts)
                 (parse-memory-operand operand)
               (declare (ignore _))
-              (unless (= (length parts) 1)
-                (error "16-bit memory operands currently support direct addresses only, got ~S."
+              (unless (member (length parts) '(1 2))
+                (error "16-bit memory operands currently support only direct addresses, got ~S."
                        operand))
               (emit-modrm state 0 reg-field 6)
-              (emit-imm16 state (first parts))))
+              (case (length parts)
+                (1
+                 (unless (word-address-designator-p (first parts))
+                   (error "16-bit direct memory operands require an integer or label, got ~S."
+                          operand))
+                 (emit-imm16 state (first parts)))
+                (2
+                 (destructuring-bind (first second) parts
+                   (let ((first-integer (let ((normalized (normalize-immediate first)))
+                                          (and (integerp normalized) normalized)))
+                         (second-integer (let ((normalized (normalize-immediate second)))
+                                           (and (integerp normalized) normalized))))
+                     (cond ((and (word-address-designator-p first) second-integer)
+                            (emit-imm16-with-addend state first second-integer))
+                           ((and first-integer (word-address-designator-p second))
+                           (emit-imm16-with-addend state second first-integer))
+                           (t
+                            (error "16-bit direct memory operands accept LABEL, ADDRESS, or LABEL+DISP forms, got ~S."
+                                   operand)))))))))
            (32
             (emit-memory-reference-32 state reg-field operand))))
         (t
@@ -871,6 +978,9 @@ against the address of the next instruction."
       (:cld
        (expect-arity 0)
        (emit-u8 state #xFC))
+      (:std
+       (expect-arity 0)
+       (emit-u8 state #xFD))
       (:hlt
        (expect-arity 0)
        (emit-u8 state #xF4))
@@ -883,6 +993,21 @@ against the address of the next instruction."
       (:lodsb
        (expect-arity 0)
        (emit-u8 state #xAC))
+      (:lodsw
+       (expect-arity 0)
+       (emit-operand-size-prefix state 16)
+       (emit-u8 state #xAD))
+      (:lodsd
+       (expect-arity 0)
+       (emit-operand-size-prefix state 32)
+       (emit-u8 state #xAD))
+      (:movsb
+       (expect-arity 0)
+       (emit-u8 state #xA4))
+      (:movsw
+       (expect-arity 0)
+       (emit-operand-size-prefix state 16)
+       (emit-u8 state #xA5))
       (:stosw
        (expect-arity 0)
        (emit-operand-size-prefix state 16)
@@ -1506,6 +1631,28 @@ against the address of the next instruction."
        (expect-arity 0)
        (emit-operand-size-prefix state 32)
        (emit-u8 state #xAB))
+      (:cmpsb
+       (expect-arity 0)
+       (emit-u8 state #xA6))
+      (:cmpsw
+       (expect-arity 0)
+       (emit-operand-size-prefix state 16)
+       (emit-u8 state #xA7))
+      (:cmpsd
+       (expect-arity 0)
+       (emit-operand-size-prefix state 32)
+       (emit-u8 state #xA7))
+      (:scasb
+       (expect-arity 0)
+       (emit-u8 state #xAE))
+      (:scasw
+       (expect-arity 0)
+       (emit-operand-size-prefix state 16)
+       (emit-u8 state #xAF))
+      (:scasd
+       (expect-arity 0)
+       (emit-operand-size-prefix state 32)
+       (emit-u8 state #xAF))
       (:movsd
        (expect-arity 0)
        (emit-operand-size-prefix state 32)
@@ -1535,6 +1682,14 @@ against the address of the next instruction."
       (:rep
        (expect-arity 1)
        (emit-u8 state #xF3)
+       (encode-instruction state (first operands) '()))
+      (:repe
+       (expect-arity 1)
+       (emit-u8 state #xF3)
+       (encode-instruction state (first operands) '()))
+      (:repne
+       (expect-arity 1)
+       (emit-u8 state #xF2)
        (encode-instruction state (first operands) '()))
       (:lock
        (when (null operands)

@@ -1,0 +1,10 @@
+;;;; Architecture helpers for the LambdaOS example.
+;;;;
+;;;; These are ordinary Common Lisp helpers loaded by INCLUDE and used through
+;;;; #. read-time evaluation from the main .bwo file.
+
+(defun lambdaos-flat-gdt (name &key pointer (limit #xAFFFF))
+  `(gdt ,name (:pointer ,pointer)
+     (:null)
+     (:code32 :base :section :limit ,limit)
+     (:data32 :base :section :limit ,limit)))

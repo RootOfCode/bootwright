@@ -1,0 +1,23 @@
+;;;; Console/data helpers for the LambdaOS example.
+
+(defun lambdaos-string (name text)
+  `(string ,name ,text))
+
+(defun lambdaos-vga-offset (row column &optional (base #xA8000) (columns 80))
+  (+ base (* 2 (+ column (* row columns)))))
+
+(defun lambdaos-cursor-index (row column &optional (columns 80))
+  (+ column (* row columns)))
+
+(defun lambdaos-render-routine (name form-label result-label status-label)
+  `(routine ,name
+     (framebuffer-print-at screen0 ,form-label   :row 11 :column 14 :attribute #x4F)
+     (framebuffer-print-at screen0 ,result-label :row 12 :column 14 :attribute #x4F)
+     (framebuffer-print-at screen0 ,status-label :row 13 :column 14 :attribute #x2E)
+     (ret)))
+
+(defun lambdaos-render-response-routine (name result-label status-label)
+  `(routine ,name
+     (framebuffer-print-at screen0 ,result-label :row 10 :column 14 :attribute #x4F)
+     (framebuffer-print-at screen0 ,status-label :row 11 :column 14 :attribute #x2E)
+     (ret)))

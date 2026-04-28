@@ -1,0 +1,209 @@
+;;;; UI and transcript routines for the LambdaOS example.
+
+(defun lambdaos-ui-module ()
+  (lambdaos-module
+    '(routine render-shell-screen
+      (framebuffer-fill-region screen0
+                               :row 0 :column 0 :width 80 :height 25
+                               :attribute attr-desktop :char 32)
+      (framebuffer-window screen0
+                          :row 2 :column 1 :width 54 :height 19
+                          :title listener-title
+                          :border-attribute attr-window-border
+                          :fill-attribute attr-window-fill
+                          :title-attribute attr-window-title)
+      (framebuffer-window screen0
+                          :row 2 :column 56 :width 23 :height 7
+                          :title commands-title
+                          :border-attribute attr-window-border
+                          :fill-attribute attr-window-fill
+                          :title-attribute attr-window-title)
+      (framebuffer-window screen0
+                          :row 9 :column 56 :width 23 :height 7
+                          :title namespace-title
+                          :border-attribute attr-window-border
+                          :fill-attribute attr-window-fill
+                          :title-attribute attr-window-title)
+      (framebuffer-window screen0
+                          :row 16 :column 56 :width 23 :height 5
+                          :title inspector-title
+                          :border-attribute attr-window-border
+                          :fill-attribute attr-window-fill
+                          :title-attribute attr-window-title)
+      (framebuffer-window screen0
+                          :row 21 :column 1 :width 78 :height 4
+                          :title minibuffer-title
+                          :border-attribute attr-window-border
+                          :fill-attribute attr-window-fill
+                          :title-attribute attr-window-title)
+      (framebuffer-print-at screen0 desktop-hint :row 1 :column 2 :attribute attr-desktop)
+      (call render-command-pane)
+      (call render-namespace-pane)
+      (call render-inspector-pane)
+      (call render-modeline)
+      (ret))
+    '(routine render-modeline
+      (framebuffer-fill-region screen0
+                               :row 0 :column 0 :width 80 :height 1
+                               :attribute attr-modeline :char 32)
+      (framebuffer-print-at screen0 modeline-title   :row 0 :column 1  :attribute attr-modeline)
+      (framebuffer-print-at screen0 modeline-uptime  :row 0 :column 34 :attribute attr-modeline)
+      (framebuffer-print-at screen0 modeline-count   :row 0 :column 49 :attribute attr-modeline)
+      (framebuffer-print-at screen0 modeline-machine :row 0 :column 67 :attribute attr-modeline)
+      (mov eax (:mem :dword uptime-seconds))
+      (vga-print-decimal eax :row 0 :column 37 :attribute attr-modeline)
+      (mov eax (:mem :dword command-count))
+      (vga-print-decimal eax :row 0 :column 53 :attribute attr-modeline)
+      (ret))
+    '(routine render-command-pane
+      (framebuffer-print-at screen0 commands-pane-1 :row 4 :column 58 :attribute attr-window-fill)
+      (framebuffer-print-at screen0 commands-pane-2 :row 5 :column 58 :attribute attr-window-fill)
+      (framebuffer-print-at screen0 commands-pane-3 :row 6 :column 58 :attribute attr-window-fill)
+      (framebuffer-print-at screen0 commands-pane-4 :row 7 :column 58 :attribute attr-window-fill)
+      (ret))
+    '(routine clear-prompt-row
+      (framebuffer-fill-region screen0
+                               :row 23 :column 2 :width 76 :height 1
+                               :attribute attr-minibuffer :char 32)
+      (ret))
+    '(routine clear-shell
+      (mov (:mem :dword transcript-offset) transcript-start-offset)
+      (framebuffer-fill-region screen0
+                               :row 4 :column 3
+                               :width transcript-scroll-width
+                               :height transcript-scroll-height
+                               :attribute attr-transcript :char 32)
+      (ret))
+    '(routine repaint-shell
+      (mov (:mem :dword transcript-offset) transcript-start-offset)
+      (call render-shell-screen)
+      (call render-banner)
+      (ret))
+    '(routine set-shell-cursor
+      (mov ebx prompt-cursor-base)
+      (add ebx (:mem :dword command-length))
+      (mov dx #x3D4)
+      (mov al #x0F)
+      (out dx al)
+      (mov dx #x3D5)
+      (mov al bl)
+      (out dx al)
+      (mov dx #x3D4)
+      (mov al #x0E)
+      (out dx al)
+      (mov dx #x3D5)
+      (mov al bh)
+      (out dx al)
+      (ret))
+    '(routine blit-counted-buffer
+      (label blit-loop)
+      (cmp ecx 0)
+      (je blit-done)
+      (lodsb)
+      (stosw)
+      (dec ecx)
+      (jmp blit-loop)
+      (label blit-done)
+      (ret))
+    '(routine render-prompt-line
+      (call clear-prompt-row)
+      (framebuffer-print-at screen0 prompt-prefix :row 23 :column 3 :attribute attr-minibuffer-prompt)
+      (mov ecx (:mem :dword command-length))
+      (cmp ecx 0)
+      (je prompt-cursor)
+      (mov edi prompt-input-offset)
+      (mov ah attr-minibuffer)
+      (lea esi (:mem command-buffer))
+      (call blit-counted-buffer)
+      (label prompt-cursor)
+      (call set-shell-cursor)
+      (ret))
+    '(routine clear-input-buffer
+      (mov (:mem :dword command-length) 0)
+      (mov (:mem :byte command-buffer) 0)
+      (call render-prompt-line)
+      (ret))
+    '(routine bump-command-count
+      (mov eax (:mem :dword command-count))
+      (add eax 1)
+      (mov (:mem :dword command-count) eax)
+      (call render-modeline)
+      (ret))
+    '(routine console-advance-line
+      (mov eax (:mem :dword transcript-offset))
+      (add eax 160)
+      (mov (:mem :dword transcript-offset) eax)
+      (ret))
+    '(routine console-ensure-line
+      (mov eax (:mem :dword transcript-offset))
+      (cmp eax transcript-last-offset)
+      (jbe-near console-line-ready)
+      (framebuffer-scroll-region screen0
+                                 :row 4 :column 3
+                                 :width transcript-scroll-width
+                                 :height transcript-scroll-height
+                                 :lines 1
+                                 :attribute attr-transcript :char 32)
+      (mov (:mem :dword transcript-offset) transcript-last-offset)
+      (label console-line-ready)
+      (ret))
+    '(routine console-write-string
+      (call console-ensure-line)
+      (mov edi (:mem :dword transcript-offset))
+      (mov ah attr-transcript)
+      (mov ecx transcript-scroll-width)
+      (label console-string-loop)
+      (lodsb)
+      (test al al)
+      (jz console-string-done)
+      (stosw)
+      (dec ecx)
+      (jnz console-string-loop)
+      (cmp (:mem :byte esi) 0)
+      (je console-string-done)
+      (call console-advance-line)
+      (call console-ensure-line)
+      (mov edi (:mem :dword transcript-offset))
+      (mov ah attr-transcript)
+      (mov ecx transcript-scroll-width)
+      (jmp console-string-loop)
+      (label console-string-done)
+      (call console-advance-line)
+      (ret))
+    '(routine console-write-decimal-line
+      (call console-ensure-line)
+      (push eax)
+      (mov edi (:mem :dword transcript-offset))
+      (mov ah attr-transcript)
+      (call bootwright::__bootwright-vga-print-z)
+      (pop ebx)
+      (mov ah attr-transcript)
+      (call bootwright::__bootwright-vga-print-decimal)
+      (call console-advance-line)
+      (ret))
+    '(routine console-log-command
+      (call console-ensure-line)
+      (mov edi (:mem :dword transcript-offset))
+      (mov ah attr-transcript-prompt)
+      (mov esi prompt-prefix)
+      (call bootwright::__bootwright-vga-print-z)
+      (mov ah attr-transcript)
+      (lea esi (:mem command-buffer))
+      (mov ecx (:mem :dword command-length))
+      (call blit-counted-buffer)
+      (call console-advance-line)
+      (ret))
+    '(routine console-log-history
+      (call console-ensure-line)
+      (mov edi (:mem :dword transcript-offset))
+      (mov ah attr-transcript-prompt)
+      (mov esi prompt-prefix)
+      (call bootwright::__bootwright-vga-print-z)
+      (mov ah attr-transcript)
+      (push edi)
+      (string-length last-command ecx)
+      (pop edi)
+      (lea esi (:mem last-command))
+      (call blit-counted-buffer)
+      (call console-advance-line)
+      (ret))))

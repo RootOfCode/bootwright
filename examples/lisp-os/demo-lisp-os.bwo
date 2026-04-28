@@ -1,0 +1,39 @@
+;;;; LambdaOS: a modular Genera-inspired listener shell for Bootwright.
+;;; qemu-system-i386 -drive format=raw,file=bootwright-lisp-os.img,if=floppy
+
+(use-machine #P"../../machines/pc-bios.bwm")
+(include "lib/architecture.bwo")
+(include "lib/console.bwo")
+(include "lib/module.bwo")
+(include "lib/config.bwo")
+(include "lib/interpreter.bwo")
+(include "lib/ui.bwo")
+(include "lib/filesystem.bwo")
+(include "lib/keyboard.bwo")
+(include "lib/shell.bwo")
+
+(defos *lisp-os-demo* (:machine pc-bios)
+  (boot-sector (:entry boot)
+    (routine boot
+      (initialize-real-mode :stack #x7C00)
+      (set-video-mode 3)
+      (enable-a20-fast)
+      (debug-print "stage1: loading lisp os demo
+")
+      (bios-print "Bootwright stage 1: loading LambdaOS...")
+      (load-section kernel32 :on-error disk-error)
+      (jump-section kernel32))
+    (routine disk-error
+      (debug-print "stage1: disk read failed
+")
+      (bios-print "Disk read failed.")
+      (hang)))
+
+  (kernel-section kernel32 (:load-segment #x1000 :entry kernel-real-entry)
+    #.(lambdaos-config-module)
+    #.(lambdaos-lisp-interpreter-module)
+    #.(lambdaos-shell-module)
+    #.(lambdaos-ui-module)
+    #.(lambdaos-filesystem-module)
+    #.(lambdaos-keyboard-driver-form)
+    #.(lambdaos-keyboard-module)))

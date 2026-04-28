@@ -61,6 +61,86 @@
   (or (section-spec-source-root (compile-environment-section environment))
       *bootwright-root*))
 
+(defun compile-nested-forms (environment forms)
+  (dolist (nested-form forms)
+    (compile-form environment nested-form)))
+
+(defun parse-conditional-clauses (form operator-name)
+  (destructuring-bind (_ operand &rest clauses) form
+    (declare (ignore _))
+    (let ((then-body nil)
+          (else-body nil))
+      (dolist (clause clauses)
+        (unless (consp clause)
+          (error "~A clauses must be lists, got ~S." operator-name clause))
+        (case (token-keyword (first clause))
+          (:then
+           (when then-body
+             (error "~A accepts at most one :THEN clause." operator-name))
+           (setf then-body (rest clause)))
+          (:else
+           (when else-body
+             (error "~A accepts at most one :ELSE clause." operator-name))
+           (setf else-body (rest clause)))
+          (t
+           (error "~A clause must start with :THEN or :ELSE, got ~S."
+                  operator-name
+                  clause))))
+      (unless then-body
+        (error "~A requires a :THEN clause." operator-name))
+      (values operand then-body else-body))))
+
+(defun emit-conditional-zero-form (environment form then-on-zero-p)
+  (let* ((state (compile-environment-state environment))
+         (operator-name (canonical-token (first form))))
+    (multiple-value-bind (operand then-body else-body)
+        (parse-conditional-clauses form operator-name)
+      (let* ((resolved (resolve-operand environment operand))
+             (else-label (gensym "IF-ELSE-"))
+             (done-label (and else-body (gensym "IF-DONE-"))))
+        (encode-instruction state 'cmp (list resolved 0))
+        (encode-instruction state
+                            (if then-on-zero-p 'jne-near 'je-near)
+                            (list else-label))
+        (compile-nested-forms environment then-body)
+        (when else-body
+          (encode-instruction state 'jmp (list done-label)))
+        (emit-label state else-label)
+        (when else-body
+          (compile-nested-forms environment else-body)
+          (emit-label state done-label))))))
+
+(defun emit-while-zero-form (environment form continue-on-zero-p)
+  (let* ((state (compile-environment-state environment))
+         (operator-name (canonical-token (first form))))
+    (destructuring-bind (_ operand &body body) form
+      (declare (ignore _))
+      (unless body
+        (error "~A requires at least one body form." operator-name))
+      (let ((start-label (gensym "WHILE-START-"))
+            (done-label (gensym "WHILE-DONE-"))
+            (resolved (resolve-operand environment operand)))
+        (emit-label state start-label)
+        (encode-instruction state 'cmp (list resolved 0))
+        (encode-instruction state
+                            (if continue-on-zero-p 'jne-near 'je-near)
+                            (list done-label))
+        (compile-nested-forms environment body)
+        (encode-instruction state 'jmp (list start-label))
+        (emit-label state done-label)))))
+
+(defun emit-forever-form (environment form)
+  (let* ((state (compile-environment-state environment))
+         (operator-name (canonical-token (first form))))
+    (destructuring-bind (_ &body body) form
+      (declare (ignore _))
+      (unless body
+        (error "~A requires at least one body form." operator-name))
+      (let ((start-label (gensym "FOREVER-START-")))
+        (emit-label state start-label)
+        (compile-nested-forms environment body)
+        (encode-instruction state 'jmp (list start-label))))))
+
 (defun environment-machine (environment)
   (compile-environment-target environment))
 
@@ -1234,6 +1314,241 @@ by linear address. Three fixups patch base[15:0], base[23:16], and base[31:24]."
                                           (vga-text-framebuffer-default-attribute framebuffer))
                          args))))
 
+(defun resolve-framebuffer-region (framebuffer args form-name)
+  (let* ((row (getf args :row 0))
+         (column (getf args :column 0))
+         (width (getf args :width))
+         (height (getf args :height))
+         (columns (vga-text-framebuffer-columns framebuffer))
+         (rows (vga-text-framebuffer-rows framebuffer)))
+    (unless (and (integerp row) (<= 0 row))
+      (error "~A :ROW must be a non-negative integer, got ~S." form-name row))
+    (unless (and (integerp column) (<= 0 column))
+      (error "~A :COLUMN must be a non-negative integer, got ~S." form-name column))
+    (unless (and (integerp width) (plusp width))
+      (error "~A :WIDTH must be a positive integer, got ~S." form-name width))
+    (unless (and (integerp height) (plusp height))
+      (error "~A :HEIGHT must be a positive integer, got ~S." form-name height))
+    (when (> (+ column width) columns)
+      (error "~A region (~D,~D ~Dx~D) exceeds the framebuffer width of ~D columns."
+             form-name row column width height columns))
+    (when (> (+ row height) rows)
+      (error "~A region (~D,~D ~Dx~D) exceeds the framebuffer height of ~D rows."
+             form-name row column width height rows))
+    (values row column width height columns rows)))
+
+(defun emit-framebuffer-fill-region (environment framebuffer-designator args)
+  (require-bits environment 32 "FRAMEBUFFER-FILL-REGION")
+  (let* ((state (compile-environment-state environment))
+         (framebuffer (resolve-framebuffer-device environment framebuffer-designator))
+         (args (resolve-operands environment args))
+         (attribute (getf args :attribute
+                          (vga-text-framebuffer-default-attribute framebuffer)))
+         (character (let ((designator (getf args :char 32)))
+                      (if (integerp designator)
+                          designator
+                          (char-code (ascii-display-char designator)))))
+         (base-address (vga-text-framebuffer-base-address framebuffer))
+         (section-base (section-linear-base (compile-environment-section environment)))
+         (row-loop (gensym "FB-FILL-ROW-"))
+         (cell-loop (gensym "FB-FILL-CELL-"))
+         (next-row (gensym "FB-FILL-NEXT-"))
+         (done (gensym "FB-FILL-DONE-")))
+    (multiple-value-bind (row column width height columns _rows)
+        (resolve-framebuffer-region framebuffer args "FRAMEBUFFER-FILL-REGION")
+      (declare (ignore _rows))
+      (unless (and (integerp attribute) (typep attribute '(integer 0 255)))
+        (error "FRAMEBUFFER-FILL-REGION :ATTRIBUTE must fit in one byte, got ~S."
+               attribute))
+      (unless (and (integerp character) (typep character '(integer 0 255)))
+        (error "FRAMEBUFFER-FILL-REGION :CHAR must fit in one byte, got ~S." character))
+      (let* ((region-offset (+ (- base-address section-base)
+                               (* 2 (+ column (* row columns)))))
+             (row-skip-bytes (* 2 (- columns width))))
+        (when (minusp region-offset)
+          (error "Framebuffer address #x~X is below the current section base #x~X."
+                 base-address section-base))
+        (encode-instruction state 'cld '())
+        (encode-instruction state 'mov (list 'edi region-offset))
+        (encode-instruction state 'mov (list 'edx height))
+        (encode-instruction state 'mov (list 'ah attribute))
+        (encode-instruction state 'mov (list 'al character))
+        (emit-label state row-loop)
+        (encode-instruction state 'test '(edx edx))
+        (encode-instruction state 'jz (list done))
+        (encode-instruction state 'mov (list 'ecx width))
+        (emit-label state cell-loop)
+        (encode-instruction state 'test '(ecx ecx))
+        (encode-instruction state 'jz (list next-row))
+        (encode-instruction state 'stosw '())
+        (encode-instruction state 'dec '(ecx))
+        (encode-instruction state 'jmp (list cell-loop))
+        (emit-label state next-row)
+        (when (plusp row-skip-bytes)
+          (encode-instruction state 'add (list 'edi row-skip-bytes)))
+        (encode-instruction state 'dec '(edx))
+        (encode-instruction state 'jmp (list row-loop))
+        (emit-label state done)))))
+
+(defun emit-framebuffer-scroll-region (environment framebuffer-designator args)
+  (require-bits environment 32 "FRAMEBUFFER-SCROLL-REGION")
+  (let* ((state (compile-environment-state environment))
+         (framebuffer (resolve-framebuffer-device environment framebuffer-designator))
+         (args (resolve-operands environment args))
+         (attribute (getf args :attribute
+                          (vga-text-framebuffer-default-attribute framebuffer)))
+         (character (let ((designator (getf args :char 32)))
+                      (if (integerp designator)
+                          designator
+                          (char-code (ascii-display-char designator)))))
+         (lines (getf args :lines 1))
+         (base-address (vga-text-framebuffer-base-address framebuffer))
+         (section-base (section-linear-base (compile-environment-section environment)))
+         (copy-row-loop (gensym "FB-REGION-SCROLL-COPY-ROW-"))
+         (copy-cell-loop (gensym "FB-REGION-SCROLL-COPY-CELL-"))
+         (copy-next-row (gensym "FB-REGION-SCROLL-COPY-NEXT-"))
+         (copy-done (gensym "FB-REGION-SCROLL-COPY-DONE-"))
+         (clear-row-loop (gensym "FB-REGION-SCROLL-CLEAR-ROW-"))
+         (clear-cell-loop (gensym "FB-REGION-SCROLL-CLEAR-CELL-"))
+         (clear-next-row (gensym "FB-REGION-SCROLL-CLEAR-NEXT-"))
+         (done (gensym "FB-REGION-SCROLL-DONE-")))
+    (multiple-value-bind (row column width height columns _rows)
+        (resolve-framebuffer-region framebuffer args "FRAMEBUFFER-SCROLL-REGION")
+      (declare (ignore _rows))
+      (unless (and (integerp lines) (<= 0 lines height))
+        (error "FRAMEBUFFER-SCROLL-REGION :LINES must be an integer from 0 to ~D, got ~S."
+               height lines))
+      (unless (and (integerp attribute) (typep attribute '(integer 0 255)))
+        (error "FRAMEBUFFER-SCROLL-REGION :ATTRIBUTE must fit in one byte, got ~S."
+               attribute))
+      (unless (and (integerp character) (typep character '(integer 0 255)))
+        (error "FRAMEBUFFER-SCROLL-REGION :CHAR must fit in one byte, got ~S." character))
+      (let* ((region-offset (+ (- base-address section-base)
+                               (* 2 (+ column (* row columns)))))
+             (row-skip-bytes (* 2 (- columns width)))
+             (moved-rows (- height lines))
+             (source-offset (+ region-offset (* 2 (* lines columns))))
+             (clear-offset (+ region-offset (* 2 (* moved-rows columns)))))
+        (when (minusp region-offset)
+          (error "Framebuffer address #x~X is below the current section base #x~X."
+                 base-address section-base))
+        (encode-instruction state 'cld '())
+        (encode-instruction state 'mov (list 'esi source-offset))
+        (encode-instruction state 'mov (list 'edi region-offset))
+        (encode-instruction state 'mov (list 'edx moved-rows))
+        (emit-label state copy-row-loop)
+        (encode-instruction state 'test '(edx edx))
+        (encode-instruction state 'jz (list copy-done))
+        (encode-instruction state 'mov (list 'ecx width))
+        (emit-label state copy-cell-loop)
+        (encode-instruction state 'test '(ecx ecx))
+        (encode-instruction state 'jz (list copy-next-row))
+        (encode-instruction state 'mov '(ax (:mem :word esi)))
+        (encode-instruction state 'mov '((:mem :word edi) ax))
+        (encode-instruction state 'add '(esi 2))
+        (encode-instruction state 'add '(edi 2))
+        (encode-instruction state 'dec '(ecx))
+        (encode-instruction state 'jmp (list copy-cell-loop))
+        (emit-label state copy-next-row)
+        (when (plusp row-skip-bytes)
+          (encode-instruction state 'add (list 'esi row-skip-bytes))
+          (encode-instruction state 'add (list 'edi row-skip-bytes)))
+        (encode-instruction state 'dec '(edx))
+        (encode-instruction state 'jmp (list copy-row-loop))
+        (emit-label state copy-done)
+        (encode-instruction state 'mov (list 'edi clear-offset))
+        (encode-instruction state 'mov (list 'edx lines))
+        (encode-instruction state 'mov (list 'ah attribute))
+        (encode-instruction state 'mov (list 'al character))
+        (emit-label state clear-row-loop)
+        (encode-instruction state 'test '(edx edx))
+        (encode-instruction state 'jz (list done))
+        (encode-instruction state 'mov (list 'ecx width))
+        (emit-label state clear-cell-loop)
+        (encode-instruction state 'test '(ecx ecx))
+        (encode-instruction state 'jz (list clear-next-row))
+        (encode-instruction state 'stosw '())
+        (encode-instruction state 'dec '(ecx))
+        (encode-instruction state 'jmp (list clear-cell-loop))
+        (emit-label state clear-next-row)
+        (when (plusp row-skip-bytes)
+          (encode-instruction state 'add (list 'edi row-skip-bytes)))
+        (encode-instruction state 'dec '(edx))
+        (encode-instruction state 'jmp (list clear-row-loop))
+        (emit-label state done)))))
+
+(defun emit-framebuffer-window (environment framebuffer-designator args)
+  (require-bits environment 32 "FRAMEBUFFER-WINDOW")
+  (let* ((framebuffer (resolve-framebuffer-device environment framebuffer-designator))
+         (args (resolve-operands environment args))
+         (border-attribute (getf args :border-attribute
+                                 (vga-text-framebuffer-default-attribute framebuffer)))
+         (fill-attribute (getf args :fill-attribute
+                               (vga-text-framebuffer-default-attribute framebuffer)))
+         (title-attribute (getf args :title-attribute border-attribute))
+         (fill-char (getf args :fill-char 32))
+         (title-fill-char (getf args :title-fill-char fill-char))
+         (vertical (getf args :vertical #\|))
+         (title (getf args :title))
+         (title-column (getf args :title-column 2))
+         (border-args (copy-list args)))
+    (multiple-value-bind (row column width height _columns _rows)
+        (resolve-framebuffer-region framebuffer args "FRAMEBUFFER-WINDOW")
+      (declare (ignore _columns _rows))
+      (unless (>= width 4)
+        (error "FRAMEBUFFER-WINDOW :WIDTH must be at least 4, got ~S." width))
+      (unless (>= height 3)
+        (error "FRAMEBUFFER-WINDOW :HEIGHT must be at least 3, got ~S." height))
+      (remf border-args :title)
+      (emit-framebuffer-fill-region environment framebuffer-designator
+                                    (list :row (1+ row)
+                                          :column (1+ column)
+                                          :width (- width 2)
+                                          :height (- height 2)
+                                          :attribute fill-attribute
+                                          :char fill-char))
+      (when title
+        (emit-framebuffer-fill-region environment framebuffer-designator
+                                      (list :row (1+ row)
+                                            :column (1+ column)
+                                            :width (- width 2)
+                                            :height 1
+                                            :attribute title-attribute
+                                            :char title-fill-char)))
+      (emit-framebuffer-print-at environment
+                                 framebuffer-designator
+                                 (make-box-top-line width border-args)
+                                 (list :row row
+                                       :column column
+                                       :attribute border-attribute))
+      (emit-framebuffer-print-at environment
+                                 framebuffer-designator
+                                 (make-box-bottom-line width border-args)
+                                 (list :row (+ row (1- height))
+                                       :column column
+                                       :attribute border-attribute))
+      (emit-framebuffer-fill-region environment framebuffer-designator
+                                    (list :row (1+ row)
+                                          :column column
+                                          :width 1
+                                          :height (- height 2)
+                                          :attribute border-attribute
+                                          :char vertical))
+      (emit-framebuffer-fill-region environment framebuffer-designator
+                                    (list :row (1+ row)
+                                          :column (+ column (1- width))
+                                          :width 1
+                                          :height (- height 2)
+                                          :attribute border-attribute
+                                          :char vertical))
+      (when title
+        (emit-framebuffer-print-at environment
+                                   framebuffer-designator
+                                   title
+                                   (list :row (1+ row)
+                                         :column (+ column title-column)
+                                         :attribute title-attribute))))))
+
 (defun emit-framebuffer-scroll (environment framebuffer-designator args)
   (require-bits environment 32 "FRAMEBUFFER-SCROLL")
   (let* ((state (compile-environment-state environment))
@@ -2080,6 +2395,252 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
                                              (print-label-designator string-designator))))
     (encode-instruction state 'call (list '__bootwright-serial-print-z))))
 
+(defun dword-immediate-designator-p (operand)
+  (let ((normalized (normalize-immediate operand)))
+    (or (integerp normalized)
+        (label-reference-p normalized)
+        (linear-reference-p normalized)
+        (linear-addend-reference-p normalized))))
+
+(defun same-register-designator-p (left right)
+  (and (typep left '(or symbol string))
+       (typep right '(or symbol string))
+       (eql (token-keyword left) (token-keyword right))))
+
+(defun normalize-memory-unit (designator form-name)
+  (case (token-keyword (or designator :byte))
+    (:byte :byte)
+    (:word :word)
+    (:dword :dword)
+    (t
+     (error "~A :UNIT must be one of :BYTE, :WORD, or :DWORD, got ~S."
+            form-name designator))))
+
+(defun unit-copy-operator (unit)
+  (ecase unit
+    (:byte 'movsb)
+    (:word 'movsw)
+    (:dword 'movsd)))
+
+(defun unit-fill-operator (unit)
+  (ecase unit
+    (:byte 'stosb)
+    (:word 'stosw)
+    (:dword 'stosd)))
+
+(defun unit-compare-operator (unit)
+  (ecase unit
+    (:byte 'cmpsb)
+    (:word 'cmpsw)
+    (:dword 'cmpsd)))
+
+(defun emit-load-pointer-register-32 (state destination designator form-name)
+  (cond ((memory-operand-p designator)
+         (error "~A expects a pointer register or address designator, not a memory dereference ~S."
+                form-name designator))
+        ((dword-register-p designator)
+         (unless (same-register-designator-p destination designator)
+           (encode-instruction state 'mov (list destination designator))))
+        ((dword-immediate-designator-p designator)
+         (encode-instruction state 'mov (list destination designator)))
+        (t
+         (error "~A expects a 32-bit pointer register or address designator, got ~S."
+                form-name designator))))
+
+(defun emit-load-count-register-32 (state designator form-name)
+  (cond ((dword-register-p designator)
+         (unless (same-register-designator-p 'ecx designator)
+           (encode-instruction state 'mov (list 'ecx designator))))
+        ((integerp designator)
+         (encode-instruction state 'mov (list 'ecx designator)))
+        (t
+         (error "~A expects COUNT to be an integer or 32-bit register, got ~S."
+                form-name designator))))
+
+(defun emit-load-fill-value (state unit designator form-name)
+  (ecase unit
+    (:byte
+     (cond ((byte-register-p designator)
+            (unless (same-register-designator-p 'al designator)
+              (encode-instruction state 'mov (list 'al designator))))
+           ((integerp designator)
+            (encode-instruction state 'mov (list 'al designator)))
+           (t
+            (error "~A with :UNIT :BYTE expects an integer or byte register value, got ~S."
+                   form-name designator))))
+    (:word
+     (cond ((word-register-p designator)
+            (unless (same-register-designator-p 'ax designator)
+              (encode-instruction state 'mov (list 'ax designator))))
+           ((integerp designator)
+            (encode-instruction state 'mov (list 'ax designator)))
+           (t
+            (error "~A with :UNIT :WORD expects an integer or word register value, got ~S."
+                   form-name designator))))
+    (:dword
+     (cond ((dword-register-p designator)
+            (unless (same-register-designator-p 'eax designator)
+              (encode-instruction state 'mov (list 'eax designator))))
+           ((integerp designator)
+            (encode-instruction state 'mov (list 'eax designator)))
+           (t
+            (error "~A with :UNIT :DWORD expects an integer or 32-bit register value, got ~S."
+                   form-name designator))))))
+
+(defun emit-copy-memory (environment args)
+  (require-bits environment 32 "COPY-MEMORY")
+  (unless (>= (length args) 3)
+    (error "COPY-MEMORY expects DESTINATION SOURCE COUNT [&key :UNIT], got ~S." args))
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (destination (first args))
+         (source (second args))
+         (count (third args))
+         (options (nthcdr 3 args))
+         (unit (normalize-memory-unit (getf options :unit :byte) "COPY-MEMORY")))
+    (emit-load-pointer-register-32 state 'edi destination "COPY-MEMORY")
+    (emit-load-pointer-register-32 state 'esi source "COPY-MEMORY")
+    (emit-load-count-register-32 state count "COPY-MEMORY")
+    (encode-instruction state 'cld '())
+    (encode-instruction state 'rep (list (unit-copy-operator unit)))))
+
+(defun emit-fill-memory (environment args)
+  (require-bits environment 32 "FILL-MEMORY")
+  (unless (>= (length args) 3)
+    (error "FILL-MEMORY expects DESTINATION VALUE COUNT [&key :UNIT], got ~S." args))
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (destination (first args))
+         (value (second args))
+         (count (third args))
+         (options (nthcdr 3 args))
+         (unit (normalize-memory-unit (getf options :unit :byte) "FILL-MEMORY")))
+    (emit-load-pointer-register-32 state 'edi destination "FILL-MEMORY")
+    (emit-load-fill-value state unit value "FILL-MEMORY")
+    (emit-load-count-register-32 state count "FILL-MEMORY")
+    (encode-instruction state 'cld '())
+    (encode-instruction state 'rep (list (unit-fill-operator unit)))))
+
+(defun emit-zero-memory (environment args)
+  (require-bits environment 32 "ZERO-MEMORY")
+  (unless (>= (length args) 2)
+    (error "ZERO-MEMORY expects DESTINATION COUNT [&key :UNIT], got ~S." args))
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (destination (first args))
+         (count (second args))
+         (options (nthcdr 2 args))
+         (unit (normalize-memory-unit (getf options :unit :byte) "ZERO-MEMORY")))
+    (emit-load-pointer-register-32 state 'edi destination "ZERO-MEMORY")
+    (encode-instruction state 'xor '(eax eax))
+    (emit-load-count-register-32 state count "ZERO-MEMORY")
+    (encode-instruction state 'cld '())
+    (encode-instruction state 'rep (list (unit-fill-operator unit)))))
+
+(defun emit-compare-memory (environment args)
+  (require-bits environment 32 "COMPARE-MEMORY")
+  (unless (>= (length args) 3)
+    (error "COMPARE-MEMORY expects LEFT RIGHT COUNT [&key :UNIT :EQUAL :NOT-EQUAL], got ~S."
+           args))
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (left (first args))
+         (right (second args))
+         (count (third args))
+         (options (nthcdr 3 args))
+         (unit (normalize-memory-unit (getf options :unit :byte) "COMPARE-MEMORY"))
+         (equal-label (getf options :equal))
+         (not-equal-label (getf options :not-equal))
+         (after-compare (gensym "CMP-MEM-AFTER-")))
+    (emit-load-pointer-register-32 state 'esi left "COMPARE-MEMORY")
+    (emit-load-pointer-register-32 state 'edi right "COMPARE-MEMORY")
+    (emit-load-count-register-32 state count "COMPARE-MEMORY")
+    (encode-instruction state 'cld '())
+    (encode-instruction state 'test '(ecx ecx))
+    (encode-instruction state 'jz-near (list after-compare))
+    (encode-instruction state 'repe (list (unit-compare-operator unit)))
+    (emit-label state after-compare)
+    (when equal-label
+      (encode-instruction state 'je-near (list equal-label)))
+    (when not-equal-label
+      (encode-instruction state 'jne-near (list not-equal-label)))))
+
+(defun emit-copy-string (environment args)
+  (require-bits environment 32 "COPY-STRING")
+  (unless (>= (length args) 2)
+    (error "COPY-STRING expects DESTINATION SOURCE, got ~S." args))
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (destination (first args))
+         (source (second args))
+         (copy-loop (gensym "COPY-STRING-LOOP-")))
+    (emit-load-pointer-register-32 state 'edi destination "COPY-STRING")
+    (emit-load-pointer-register-32 state 'esi source "COPY-STRING")
+    (encode-instruction state 'cld '())
+    (emit-label state copy-loop)
+    (encode-instruction state 'lodsb '())
+    (encode-instruction state 'stosb '())
+    (encode-instruction state 'test '(al al))
+    (encode-instruction state 'jnz-near (list copy-loop))))
+
+(defun emit-string-length (environment args)
+  (require-bits environment 32 "STRING-LENGTH")
+  (unless (>= (length args) 2)
+    (error "STRING-LENGTH expects SOURCE DESTINATION-REGISTER, got ~S." args))
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (source (first args))
+         (destination (second args)))
+    (unless (dword-register-p destination)
+      (error "STRING-LENGTH destination must be a 32-bit register, got ~S." destination))
+    (emit-load-pointer-register-32 state 'edi source "STRING-LENGTH")
+    (encode-instruction state 'mov '(ecx #xFFFFFFFF))
+    (encode-instruction state 'xor '(eax eax))
+    (encode-instruction state 'cld '())
+    (encode-instruction state 'repne '(scasb))
+    (encode-instruction state 'not '(ecx))
+    (encode-instruction state 'dec '(ecx))
+    (unless (same-register-designator-p destination 'ecx)
+      (encode-instruction state 'mov (list destination 'ecx)))))
+
+(defun emit-string-equal (environment args)
+  (require-bits environment 32 "STRING-EQUAL")
+  (unless (>= (length args) 2)
+    (error "STRING-EQUAL expects LEFT RIGHT [&key :EQUAL :NOT-EQUAL], got ~S." args))
+  (let* ((state (compile-environment-state environment))
+         (args (resolve-operands environment args))
+         (left (first args))
+         (right (second args))
+         (options (nthcdr 2 args))
+         (equal-label (getf options :equal))
+         (not-equal-label (getf options :not-equal))
+         (compare-loop (gensym "STRING-EQUAL-LOOP-"))
+         (strings-equal (gensym "STRING-EQUAL-YES-"))
+         (dispatch (gensym "STRING-EQUAL-DISPATCH-"))
+         (mismatch (gensym "STRING-EQUAL-NO-")))
+    (emit-load-pointer-register-32 state 'esi left "STRING-EQUAL")
+    (emit-load-pointer-register-32 state 'edi right "STRING-EQUAL")
+    (encode-instruction state 'cld '())
+    (emit-label state compare-loop)
+    (encode-instruction state 'mov '(al (:mem :byte esi)))
+    (encode-instruction state 'mov '(dl (:mem :byte edi)))
+    (encode-instruction state 'cmp '(al dl))
+    (encode-instruction state 'jne-near (list mismatch))
+    (encode-instruction state 'test '(al al))
+    (encode-instruction state 'jz-near (list strings-equal))
+    (encode-instruction state 'inc '(esi))
+    (encode-instruction state 'inc '(edi))
+    (encode-instruction state 'jmp (list compare-loop))
+    (emit-label state mismatch)
+    (encode-instruction state 'jmp (list dispatch))
+    (emit-label state strings-equal)
+    (encode-instruction state 'test '(al al))
+    (emit-label state dispatch)
+    (when equal-label
+      (encode-instruction state 'je-near (list equal-label)))
+    (when not-equal-label
+      (encode-instruction state 'jne-near (list not-equal-label)))))
+
 (defun emit-pc-speaker-tone (environment args)
   (let* ((state (compile-environment-state environment))
          (args (resolve-operands environment args))
@@ -2110,9 +2671,11 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
 (defstruct (keyboard-descriptor
             (:constructor make-keyboard-descriptor
                 (&key name controller irq buffer-size scancode-map
-                      handler-label table-label buffer-label head-label tail-label)))
+                      handler-label table-label shifted-table-label
+                      buffer-label head-label tail-label shift-state-label)))
   name controller irq buffer-size scancode-map
-  handler-label table-label buffer-label head-label tail-label)
+  handler-label table-label shifted-table-label
+  buffer-label head-label tail-label shift-state-label)
 
 (defparameter +keyboard-us-qwerty-table+
   ;; 128-byte set-1 scancode -> ASCII (0 = unmapped / modifier / release-class).
@@ -2140,6 +2703,52 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
           (aref table #x39) #x20)                          ; SPACE
     table))
 
+(defun clone-keyboard-table (table)
+  (let ((copy (make-array (length table)
+                          :element-type '(unsigned-byte 8)
+                          :initial-element 0)))
+    (replace copy table)
+    copy))
+
+(defparameter +keyboard-us-qwerty-shift-table+
+  (let ((table (clone-keyboard-table +keyboard-us-qwerty-table+)))
+    (loop for ch across "!@#$%^&*()"
+          for i from #x02
+          do (setf (aref table i) (char-code ch)))
+    (setf (aref table #x0C) #x5F                           ; '_'
+          (aref table #x0D) #x2B)                          ; '+'
+    (loop for ch across "QWERTYUIOP{}"
+          for i from 0
+          do (setf (aref table (+ #x10 i)) (char-code ch)))
+    (loop for ch across "ASDFGHJKL:\"~"
+          for i from 0
+          do (setf (aref table (+ #x1E i)) (char-code ch)))
+    (setf (aref table #x2B) #x7C)                          ; '|'
+    (loop for ch across "ZXCVBNM<>?"
+          for i from 0
+          do (setf (aref table (+ #x2C i)) (char-code ch)))
+    table))
+
+(defparameter +keyboard-lenovo-ideapad-3-table+
+  (let ((table (clone-keyboard-table +keyboard-us-qwerty-table+)))
+    ;; Treat the extra ISO/OEM key as backslash on Lenovo IdeaPad 3 style layouts.
+    (setf (aref table #x56) #x5C)
+    table))
+
+(defparameter +keyboard-lenovo-ideapad-3-shift-table+
+  (let ((table (clone-keyboard-table +keyboard-us-qwerty-shift-table+)))
+    (setf (aref table #x56) #x7C)
+    table))
+
+(defun keyboard-layout-tables (layout)
+  (ecase layout
+    (:us-qwerty
+     (values +keyboard-us-qwerty-table+
+             +keyboard-us-qwerty-shift-table+))
+    (:lenovo-ideapad-3
+     (values +keyboard-lenovo-ideapad-3-table+
+             +keyboard-lenovo-ideapad-3-shift-table+))))
+
 (defun derive-keyboard-label (name suffix)
   (intern (concatenate 'string (symbol-name name) suffix)
           (or (symbol-package name) *package*)))
@@ -2151,11 +2760,16 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
 
 (defun emit-keyboard-handler (environment kbd)
   (let* ((state (compile-environment-state environment))
+         (shift-press-label (gensym "KBD-SHIFT-PRESS-"))
+         (shift-release-label (gensym "KBD-SHIFT-RELEASE-"))
+         (normal-table-label (gensym "KBD-NORMAL-TABLE-"))
          (eoi-label (gensym "KBD-EOI-"))
          (handler (keyboard-descriptor-handler-label kbd))
          (table (keyboard-descriptor-table-label kbd))
+         (shifted-table (keyboard-descriptor-shifted-table-label kbd))
          (buffer (keyboard-descriptor-buffer-label kbd))
          (tail (keyboard-descriptor-tail-label kbd))
+         (shift-state (keyboard-descriptor-shift-state-label kbd))
          (mask (1- (keyboard-descriptor-buffer-size kbd)))
          (irq (keyboard-descriptor-irq kbd)))
     (emit-label state handler)
@@ -2163,10 +2777,22 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
     (encode-instruction state 'push '(ebx))
     (encode-instruction state 'push '(ecx))
     (encode-instruction state 'in (list 'al #x60))
+    (encode-instruction state 'cmp '(al #x2A))
+    (encode-instruction state 'je-near (list shift-press-label))
+    (encode-instruction state 'cmp '(al #x36))
+    (encode-instruction state 'je-near (list shift-press-label))
+    (encode-instruction state 'cmp '(al #xAA))
+    (encode-instruction state 'je-near (list shift-release-label))
+    (encode-instruction state 'cmp '(al #xB6))
+    (encode-instruction state 'je-near (list shift-release-label))
     (encode-instruction state 'test '(al #x80))
     (encode-instruction state 'jnz-near (list eoi-label))
     (encode-instruction state 'movzx '(ecx al))
     (encode-instruction state 'mov (list 'ebx table))
+    (encode-instruction state 'cmp (list (list :MEM :BYTE shift-state) 0))
+    (encode-instruction state 'je-near (list normal-table-label))
+    (encode-instruction state 'mov (list 'ebx shifted-table))
+    (emit-label state normal-table-label)
     (encode-instruction state 'mov (list 'bl (list :MEM :BYTE 'ebx 'ecx 1 0)))
     (encode-instruction state 'test '(bl bl))
     (encode-instruction state 'jz-near (list eoi-label))
@@ -2176,6 +2802,12 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
     (encode-instruction state 'inc '(cl))
     (encode-instruction state 'and (list 'cl mask))
     (encode-instruction state 'mov (list (list :MEM :BYTE tail) 'cl))
+    (encode-instruction state 'jmp (list eoi-label))
+    (emit-label state shift-press-label)
+    (encode-instruction state 'mov (list (list :MEM :BYTE shift-state) 1))
+    (encode-instruction state 'jmp (list eoi-label))
+    (emit-label state shift-release-label)
+    (encode-instruction state 'mov (list (list :MEM :BYTE shift-state) 0))
     (emit-label state eoi-label)
     (emit-irq-end-of-interrupt environment (list irq))
     (encode-instruction state 'pop '(ecx))
@@ -2190,11 +2822,12 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
          (controller (or (getf options :controller) :ps2))
          (irq (getf options :irq 1))
          (buffer-size (getf options :buffer-size 64))
-         (scancode-map (or (getf options :scancode-map) :us-qwerty)))
+         (scancode-map (or (getf options :scancode-map) :lenovo-ideapad-3)))
     (unless (eq controller :ps2)
       (error "KEYBOARD-DRIVER currently only supports :PS2, got ~S." controller))
-    (unless (eq scancode-map :us-qwerty)
-      (error "KEYBOARD-DRIVER currently only supports :US-QWERTY, got ~S." scancode-map))
+    (unless (member scancode-map '(:us-qwerty :lenovo-ideapad-3))
+      (error "KEYBOARD-DRIVER currently supports :US-QWERTY and :LENOVO-IDEAPAD-3, got ~S."
+             scancode-map))
     (unless (and (integerp buffer-size)
                  (>= buffer-size 2)
                  (<= buffer-size 256)
@@ -2210,9 +2843,11 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
      :scancode-map scancode-map
      :handler-label (derive-keyboard-label name "-HANDLER")
      :table-label   (derive-keyboard-label name "-TABLE")
+     :shifted-table-label (derive-keyboard-label name "-SHIFT-TABLE")
      :buffer-label  (derive-keyboard-label name "-BUFFER")
      :head-label    (derive-keyboard-label name "-HEAD")
-     :tail-label    (derive-keyboard-label name "-TAIL"))))
+     :tail-label    (derive-keyboard-label name "-TAIL")
+     :shift-state-label (derive-keyboard-label name "-SHIFT-STATE"))))
 
 (defun register-keyboard-driver (environment form)
   (let* ((kbd (parse-keyboard-driver-form environment form))
@@ -2229,14 +2864,21 @@ All other fields zero. Use with (:tss :label NAME) in a GDT and (load-tr ...)."
          (kbd (lookup-keyboard environment name)))
     (emit-align state 4)
     (emit-label state name)
-    (emit-label state (keyboard-descriptor-table-label kbd))
-    (loop for byte across +keyboard-us-qwerty-table+ do
-      (emit-u8 state byte))
+    (multiple-value-bind (normal-table shifted-table)
+        (keyboard-layout-tables (keyboard-descriptor-scancode-map kbd))
+      (emit-label state (keyboard-descriptor-table-label kbd))
+      (loop for byte across normal-table do
+        (emit-u8 state byte))
+      (emit-label state (keyboard-descriptor-shifted-table-label kbd))
+      (loop for byte across shifted-table do
+        (emit-u8 state byte)))
     (emit-label state (keyboard-descriptor-buffer-label kbd))
     (loop repeat (keyboard-descriptor-buffer-size kbd) do (emit-u8 state 0))
     (emit-label state (keyboard-descriptor-head-label kbd))
     (emit-u8 state 0)
     (emit-label state (keyboard-descriptor-tail-label kbd))
+    (emit-u8 state 0)
+    (emit-label state (keyboard-descriptor-shift-state-label kbd))
     (emit-u8 state 0)
     (emit-keyboard-handler environment kbd)))
 
@@ -3466,6 +4108,89 @@ volume's runtime START-LBA cell."
                                            (when stopped
                                              (return)))
                                   (values current bits constants max-depth stopped))))
+                             (:forever
+                              (destructuring-bind (_ &body loop-body) form
+                                (declare (ignore _))
+                                (multiple-value-bind (loop-current loop-bits loop-constants loop-max loop-stop)
+                                    (walk-forms loop-body
+                                                current
+                                                bits
+                                                (copy-label-table constants)
+                                                max-depth)
+                                  (declare (ignore loop-current loop-bits loop-constants loop-stop))
+                                  (values current bits constants loop-max t))))
+                             (:while-zero
+                              (destructuring-bind (_ operand &body loop-body) form
+                                (declare (ignore _ operand))
+                                (multiple-value-bind (loop-current loop-bits loop-constants loop-max loop-stop)
+                                    (walk-forms loop-body
+                                                current
+                                                bits
+                                                (copy-label-table constants)
+                                                max-depth)
+                                  (declare (ignore loop-current loop-bits loop-constants loop-stop))
+                                  (values current bits constants loop-max nil))))
+                             (:while-nonzero
+                              (destructuring-bind (_ operand &body loop-body) form
+                                (declare (ignore _ operand))
+                                (multiple-value-bind (loop-current loop-bits loop-constants loop-max loop-stop)
+                                    (walk-forms loop-body
+                                                current
+                                                bits
+                                                (copy-label-table constants)
+                                                max-depth)
+                                  (declare (ignore loop-current loop-bits loop-constants loop-stop))
+                                  (values current bits constants loop-max nil))))
+                             (:if-zero
+                              (multiple-value-bind (_ then-body else-body)
+                                  (parse-conditional-clauses form "IF-ZERO")
+                                (declare (ignore _))
+                                (multiple-value-bind (then-current then-bits then-constants then-max then-stop)
+                                    (walk-forms then-body
+                                                current
+                                                bits
+                                                (copy-label-table constants)
+                                                max-depth)
+                                  (declare (ignore then-current then-bits then-constants))
+                                  (if else-body
+                                      (multiple-value-bind (else-current else-bits else-constants else-max else-stop)
+                                          (walk-forms else-body
+                                                      current
+                                                      bits
+                                                      (copy-label-table constants)
+                                                      then-max)
+                                        (declare (ignore else-current else-bits else-constants))
+                                        (values current
+                                                bits
+                                                constants
+                                                else-max
+                                                (and then-stop else-stop)))
+                                      (values current bits constants then-max nil)))))
+                             (:if-nonzero
+                              (multiple-value-bind (_ then-body else-body)
+                                  (parse-conditional-clauses form "IF-NONZERO")
+                                (declare (ignore _))
+                                (multiple-value-bind (then-current then-bits then-constants then-max then-stop)
+                                    (walk-forms then-body
+                                                current
+                                                bits
+                                                (copy-label-table constants)
+                                                max-depth)
+                                  (declare (ignore then-current then-bits then-constants))
+                                  (if else-body
+                                      (multiple-value-bind (else-current else-bits else-constants else-max else-stop)
+                                          (walk-forms else-body
+                                                      current
+                                                      bits
+                                                      (copy-label-table constants)
+                                                      then-max)
+                                        (declare (ignore else-current else-bits else-constants))
+                                        (values current
+                                                bits
+                                                constants
+                                                else-max
+                                                (and then-stop else-stop)))
+                                      (values current bits constants then-max nil)))))
                              (:routine
                               (values current bits constants max-depth nil))
                              (:irq-handler
@@ -3628,34 +4353,69 @@ volume's runtime START-LBA cell."
     (encode-instruction state 'and (list 'cl mask))
     (encode-instruction state 'mov (list (list :MEM :BYTE head) 'cl))))
 
-(defun ensure-floppy-track-range (layout)
-  (let ((last-sector (+ (section-layout-start-lba layout)
-                        (section-layout-sector-count layout))))
-    (when (> last-sector 18)
-      (error "Section ~S exceeds the single-track BIOS loader used by Bootwright."
-             (section-layout-name layout)))))
+(defparameter +bootwright-floppy-sectors-per-track+ 18)
+(defparameter +bootwright-floppy-heads+ 2)
+
+(defun ensure-floppy-chs-range (lba)
+  (let* ((sectors-per-cylinder (* +bootwright-floppy-sectors-per-track+
+                                  +bootwright-floppy-heads+))
+         (cylinder (floor lba sectors-per-cylinder)))
+    (when (> cylinder 1023)
+      (error "Section LBA ~D exceeds the BIOS CHS range Bootwright currently supports."
+             lba))))
+
+(defun lba-to-floppy-chs (lba)
+  (ensure-floppy-chs-range lba)
+  (let* ((sectors-per-cylinder (* +bootwright-floppy-sectors-per-track+
+                                  +bootwright-floppy-heads+))
+         (cylinder (floor lba sectors-per-cylinder))
+         (cylinder-offset (mod lba sectors-per-cylinder))
+         (head (floor cylinder-offset +bootwright-floppy-sectors-per-track+))
+         (sector (1+ (mod cylinder-offset +bootwright-floppy-sectors-per-track+))))
+    (values cylinder head sector)))
 
 (defun emit-load-section (environment section-name args)
   (let* ((state (compile-environment-state environment))
          (layout (find-section-layout (compile-environment-layouts environment)
                                       section-name))
          (args (resolve-operands environment args))
-         (error-label (getf args :on-error)))
-    (ensure-floppy-track-range layout)
+         (error-label (getf args :on-error))
+         (start-lba (section-layout-start-lba layout))
+         (remaining (section-layout-sector-count layout))
+         (load-segment (section-layout-load-segment layout))
+         (load-offset (section-layout-load-offset layout))
+         (linear-address (+ (* 16 load-segment) load-offset)))
     (unless (section-layout-load-segment layout)
       (error "Section ~S has no load segment and cannot be read by the BIOS loader."
              section-name))
-    (encode-instruction state 'mov (list 'ax (section-layout-load-segment layout)))
-    (encode-instruction state 'mov '(es ax))
-    (encode-instruction state 'mov (list 'bx (section-layout-load-offset layout)))
-    (encode-instruction state 'mov '(ah #x02))
-    (encode-instruction state 'mov (list 'al (section-layout-sector-count layout)))
-    (encode-instruction state 'mov '(ch 0))
-    (encode-instruction state 'mov (list 'cl (1+ (section-layout-start-lba layout))))
-    (encode-instruction state 'mov '(dh 0))
-    (encode-instruction state 'int '(#x13))
-    (when error-label
-      (encode-instruction state 'jc (list error-label)))))
+    (loop with current-lba = start-lba
+          with current-linear = linear-address
+          while (> remaining 0)
+          do (multiple-value-bind (cylinder head sector)
+                 (lba-to-floppy-chs current-lba)
+               (let* ((sector-offset (mod current-lba +bootwright-floppy-sectors-per-track+))
+                      (track-space (- +bootwright-floppy-sectors-per-track+ sector-offset))
+                      (segment (floor current-linear 16))
+                      (offset (mod current-linear 16))
+                      (bytes-to-boundary (- #x10000 offset))
+                      (boundary-space (max 1 (floor bytes-to-boundary 512)))
+                      (chunk (min remaining track-space boundary-space))
+                      (cl-value (logior sector
+                                        (ash (logand cylinder #x300) -2))))
+                 (encode-instruction state 'mov (list 'ax segment))
+                 (encode-instruction state 'mov '(es ax))
+                 (encode-instruction state 'mov (list 'bx offset))
+                 (encode-instruction state 'mov '(ah #x02))
+                 (encode-instruction state 'mov (list 'al chunk))
+                 (encode-instruction state 'mov (list 'ch (logand cylinder #xFF)))
+                 (encode-instruction state 'mov (list 'cl cl-value))
+                 (encode-instruction state 'mov (list 'dh head))
+                 (encode-instruction state 'int '(#x13))
+                 (when error-label
+                   (encode-instruction state 'jc (list error-label)))
+                 (decf remaining chunk)
+                 (incf current-lba chunk)
+                 (incf current-linear (* chunk 512)))))))
 
 (defun emit-jump-section (environment section-name)
   (let ((layout (find-section-layout (compile-environment-layouts environment)
@@ -3714,12 +4474,37 @@ volume's runtime START-LBA cell."
            (loop repeat count do
              (dolist (nested-form body)
                (compile-form environment nested-form))))))
+      (:forever
+       (emit-forever-form environment form))
+      (:while-zero
+       (emit-while-zero-form environment form t))
+      (:while-nonzero
+       (emit-while-zero-form environment form nil))
+      (:if-zero
+       (emit-conditional-zero-form environment form t))
+      (:if-nonzero
+       (emit-conditional-zero-form environment form nil))
       (:db
        (emit-db state (resolve-operands environment (rest form))))
       (:dw
        (emit-dw state (resolve-operands environment (rest form))))
       (:dd
        (emit-dd state (resolve-operands environment (rest form))))
+      (:resb
+       (destructuring-bind (_ count) form
+         (declare (ignore _))
+         (loop repeat (resolve-operand environment count) do
+           (emit-u8 state 0))))
+      (:resw
+       (destructuring-bind (_ count) form
+         (declare (ignore _))
+         (loop repeat (resolve-operand environment count) do
+           (emit-u16 state 0))))
+      (:resd
+       (destructuring-bind (_ count) form
+         (declare (ignore _))
+         (loop repeat (resolve-operand environment count) do
+           (emit-u32 state 0))))
       (:ascii
        (destructuring-bind (_ string) form
          (declare (ignore _))
@@ -3747,6 +4532,20 @@ volume's runtime START-LBA cell."
          (declare (ignore _))
          (loop repeat (resolve-operand environment count) do
            (emit-u8 state (resolve-operand environment fill-byte)))))
+      (:copy-memory
+       (emit-copy-memory environment (rest form)))
+      (:fill-memory
+       (emit-fill-memory environment (rest form)))
+      (:zero-memory
+       (emit-zero-memory environment (rest form)))
+      (:compare-memory
+       (emit-compare-memory environment (rest form)))
+      (:copy-string
+       (emit-copy-string environment (rest form)))
+      (:string-length
+       (emit-string-length environment (rest form)))
+      (:string-equal
+       (emit-string-equal environment (rest form)))
       (:bits
        (destructuring-bind (_ bits) form
          (declare (ignore _))
@@ -3814,12 +4613,30 @@ volume's runtime START-LBA cell."
          (emit-framebuffer-box environment
                                (resolve-operand environment framebuffer-designator)
                                (resolve-operands environment args))))
+      (:framebuffer-fill-region
+       (destructuring-bind (_ framebuffer-designator &rest args) form
+         (declare (ignore _))
+         (emit-framebuffer-fill-region environment
+                                       (resolve-operand environment framebuffer-designator)
+                                       (resolve-operands environment args))))
+      (:framebuffer-window
+       (destructuring-bind (_ framebuffer-designator &rest args) form
+         (declare (ignore _))
+         (emit-framebuffer-window environment
+                                  (resolve-operand environment framebuffer-designator)
+                                  (resolve-operands environment args))))
       (:framebuffer-scroll
        (destructuring-bind (_ framebuffer-designator &rest args) form
          (declare (ignore _))
          (emit-framebuffer-scroll environment
                                   (resolve-operand environment framebuffer-designator)
                                   (resolve-operands environment args))))
+      (:framebuffer-scroll-region
+       (destructuring-bind (_ framebuffer-designator &rest args) form
+         (declare (ignore _))
+         (emit-framebuffer-scroll-region environment
+                                         (resolve-operand environment framebuffer-designator)
+                                         (resolve-operands environment args))))
       (:vga-print-hex
        (destructuring-bind (_ value-designator &rest args) form
          (declare (ignore _))

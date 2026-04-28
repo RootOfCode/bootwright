@@ -1,0 +1,22 @@
+;;;; Module helpers for the LambdaOS example.
+
+(defun lambdaos-normalize-module-chunk (chunk)
+  (if (and (consp chunk) (consp (first chunk)))
+      chunk
+      (list chunk)))
+
+(defun lambdaos-module (&rest chunks)
+  `(repeat 1
+     ,@(apply #'append (mapcar #'lambdaos-normalize-module-chunk chunks))))
+
+(defun lambdaos-consts (&rest specs)
+  (mapcar (lambda (spec)
+            (destructuring-bind (name value) spec
+              `(const ,name ,value)))
+          specs))
+
+(defun lambdaos-strings (&rest specs)
+  (mapcar (lambda (spec)
+            (destructuring-bind (name text) spec
+              (lambdaos-string name text)))
+          specs))
